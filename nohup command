@@ -1,0 +1,1 @@
+nohup /home/gzm/cp310pt26/bin/python /home/gzm/gzm-MTRRVideo/train.py > project.log 2>&1 &

@@ -1,0 +1,9 @@
+__pycache__
+.vscode
+data
+data/**
+logs
+MAMBA
+model_fit
+img_results
+indexcsv
