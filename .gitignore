@@ -7,3 +7,12 @@ MAMBA
 model_fit
 img_results
 indexcsv
+Naf_Hwa_TEST/
+pretrained/
+SwinMam_TEST/
+hwablock.py
+nafblock.py
+*.log
+debug/
+cls/
+aaa_MAMBA/

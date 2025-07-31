@@ -24,16 +24,19 @@ class CustomLoss(torch.nn.Module):
         self.feature_layers = {1, 6, 11, 20, 29}
         
         # 2. 调整损失权重，避免过大权重
-        self.ssim_loss_weight = 1.0
-        self.vgg_loss_weight = 0.5  # 从0.7降低到0.5，减少VGG损失的影响
+        self.ssim_loss_weight = 0.5
+        self.vgg_loss_weight = 1  # 从0.7降低到0.5，减少VGG损失的影响
         self.mse_loss_weight = 0.3
+        self.color_loss_weight = 0.4
         
-        self.fake_R_weight = 0.4
+        self.fake_R_weight = 0.3
         self.fake_T_weight = 1.0
-        self.Rcmaps_weight = 0
-        self.all_img_weight = 0
+        self.Rcmaps_weight = 0.1
+        self.all_img_weight = 0.1
 
     def forward(self, fake_Ts, label1, input_image, rcmaps, fake_Rs, label2):
+
+
         # 3. 使用eps参数确保所有输入在有效范围内
         eps = 1e-6
         fake_Ts = torch.clamp(fake_Ts, eps, 1.0-eps)
@@ -46,58 +49,50 @@ class CustomLoss(torch.nn.Module):
         # 计算fake_Rs的损失
         fake_R_mse_loss = F.mse_loss(fake_Rs, label2) * self.mse_loss_weight
         fake_R_vgg_loss = self.compute_perceptual_loss(fake_Rs, label2) * self.vgg_loss_weight
-        
-        # 4. 用try-except处理SSIM可能的数值问题
-        try:
-            fake_R_ssim_loss = (1 - self.ssim_metric(fake_Rs, label2)) * self.ssim_loss_weight
-        except:
-            print("Warning: SSIM calculation failed for fake_Rs. Using MSE as fallback.")
-            fake_R_ssim_loss = F.mse_loss(fake_Rs, label2) * self.ssim_loss_weight
+        fake_R_ssim_loss = (1 - self.ssim_metric(fake_Rs, label2)) * self.ssim_loss_weight
+        fake_R_color_loss = color_mean_loss(fake_Rs, label2) * self.color_loss_weight
+
 
         # 计算fake_Ts的损失
         fake_T_mse_loss = F.mse_loss(fake_Ts, label1) * self.mse_loss_weight
         fake_T_vgg_loss = self.compute_perceptual_loss(fake_Ts, label1) * self.vgg_loss_weight
-        
-        try:
-            fake_T_ssim_loss = (1 - self.ssim_metric(fake_Ts, label1)) * self.ssim_loss_weight
-        except:
-            print("Warning: SSIM calculation failed for fake_Ts. Using MSE as fallback.")
-            fake_T_ssim_loss = F.mse_loss(fake_Ts, label1) * self.ssim_loss_weight
+        fake_T_ssim_loss = (1 - self.ssim_metric(fake_Ts, label1)) * self.ssim_loss_weight
+        fake_T_color_loss = color_mean_loss(fake_Ts, label1) * self.color_loss_weight
+
 
         # Rcmaps检测，使用更安全的方式计算
         # 5. 使用torch.clamp的同时注意梯度流
-        I_R_diff = torch.clamp(input_image - label2, 0.0, 1.0)
-        RCMap_test_img = torch.clamp(rcmaps * label1, 0.0, 1.0)
+        I_R_diff = torch.clamp(input_image - label1, 0.0, 1.0)
+        RCMap_test_img = torch.clamp((1-rcmaps) * input_image, 0.0, 1.0)
         
         Rcmaps_mse_loss = F.mse_loss(RCMap_test_img, I_R_diff) * self.mse_loss_weight
         Rcmaps_vgg_loss = self.compute_perceptual_loss(RCMap_test_img, I_R_diff) * self.vgg_loss_weight
-        
-        try:
-            Rcmaps_ssim_loss = (1 - self.ssim_metric(RCMap_test_img, I_R_diff)) * self.ssim_loss_weight
-        except:
-            print("Warning: SSIM calculation failed for Rcmaps. Using MSE as fallback.")
-            Rcmaps_ssim_loss = F.mse_loss(RCMap_test_img, I_R_diff) * self.ssim_loss_weight
+        Rcmaps_ssim_loss = (1 - self.ssim_metric(RCMap_test_img, I_R_diff)) * self.ssim_loss_weight
+        Rcmaps_color_loss = color_mean_loss(RCMap_test_img, I_R_diff) * self.color_loss_weight
+        epsilon = 1e-8
+        Rcmaps_entropy_loss = -torch.mean(
+            rcmaps * torch.log(rcmaps + epsilon) + (1 - rcmaps) * torch.log(1 - rcmaps + epsilon)
+        ) # 放在mse loss里
+
         
         # 总和检测
         all_img = torch.clamp(fake_Ts * rcmaps + fake_Rs, 0.0, 1.0)
         all_img_mse_loss = F.mse_loss(all_img, input_image) * self.mse_loss_weight
         all_img_vgg_loss = self.compute_perceptual_loss(all_img, input_image) * self.vgg_loss_weight
-        
-        try:
-            all_img_ssim_loss = (1 - self.ssim_metric(all_img, input_image)) * self.ssim_loss_weight
-        except:
-            print("Warning: SSIM calculation failed for all_img. Using MSE as fallback.")
-            all_img_ssim_loss = F.mse_loss(all_img, input_image) * self.ssim_loss_weight
+        all_img_ssim_loss = (1 - self.ssim_metric(all_img, input_image)) * self.ssim_loss_weight
+        all_img_color_loss = color_mean_loss(all_img, input_image) * self.color_loss_weight
+
 
         # 6. 分别计算损失并应用权重，避免中间项过大
         mse_loss = (
             fake_R_mse_loss * self.fake_R_weight + 
             fake_T_mse_loss * self.fake_T_weight + 
             Rcmaps_mse_loss * self.Rcmaps_weight + 
-            all_img_mse_loss * self.all_img_weight
+            all_img_mse_loss * self.all_img_weight +
+            Rcmaps_entropy_loss
         )
         
-        # 7. VGG损失除以10而不是5，减少其幅度
+        # 7. VGG损失除以5
         vgg_loss = (
             fake_R_vgg_loss * self.fake_R_weight + 
             fake_T_vgg_loss * self.fake_T_weight + 
@@ -106,20 +101,27 @@ class CustomLoss(torch.nn.Module):
         )
         
         ssim_loss = (
-            fake_R_ssim_loss * self.fake_R_weight + 
-            fake_T_ssim_loss * self.fake_T_weight + 
-            Rcmaps_ssim_loss * self.Rcmaps_weight + 
+            fake_R_ssim_loss *  self.fake_R_weight + 
+            fake_T_ssim_loss *  self.fake_T_weight + 
+            Rcmaps_ssim_loss *  self.Rcmaps_weight + 
             all_img_ssim_loss * self.all_img_weight
+        )
+
+        color_loss = (
+            fake_R_color_loss   * self.fake_R_weight + 
+            fake_T_color_loss   * self.fake_T_weight +
+            Rcmaps_color_loss   * self.Rcmaps_weight +
+            all_img_color_loss  * self.all_img_weight
         )
         
         # 8. 对vgg_loss除以10而非5，进一步降低其影响
-        total_loss = mse_loss + vgg_loss/10 + ssim_loss
+        total_loss = mse_loss + vgg_loss/5 + ssim_loss + color_loss
         
         # 9. 确保最终损失没有NaN
         if torch.isnan(total_loss) or torch.isinf(total_loss):
             print("Warning: NaN or Inf detected in loss calculation!")
             # 回退到简单的MSE损失
-            total_loss = F.mse_loss(fake_Ts, label1) + F.mse_loss(fake_Rs, label2)
+            # total_loss = F.mse_loss(fake_Ts, label1) + F.mse_loss(fake_Rs, label2)
 
         loss_table = {
             'fake_R_mse_loss': fake_R_mse_loss,
@@ -137,11 +139,16 @@ class CustomLoss(torch.nn.Module):
             'Rcmaps_ssim_loss': Rcmaps_ssim_loss,
             'all_img_ssim_loss': all_img_ssim_loss,
             'ssim_loss': ssim_loss,
+            'fake_R_color_loss':fake_R_color_loss,
+            'fake_T_color_loss':fake_T_color_loss,
+            'Rcmaps_color_loss':Rcmaps_color_loss,
+            'all_img_color_loss':all_img_color_loss,
+            'color_loss':color_loss,
             'total_loss': total_loss
         }
         
         # 返回的仍然是相同格式，但vgg_loss已经除以10了
-        return loss_table, mse_loss, vgg_loss/10, ssim_loss, total_loss
+        return loss_table, mse_loss, vgg_loss/10, ssim_loss, color_loss, total_loss
 
     def compute_perceptual_loss(self, x, y):
         """
@@ -154,7 +161,10 @@ class CustomLoss(torch.nn.Module):
         # 10. 确保输入在有效范围内
         x = torch.clamp(x, 0.0, 1.0)
         y = torch.clamp(y, 0.0, 1.0)
-        
+        mean = torch.tensor([0.485, 0.456, 0.406], device=x.device).view(1, 3, 1, 1)
+        std  = torch.tensor([0.229, 0.224, 0.225], device=x.device).view(1, 3, 1, 1)
+        x = (x - mean) / std
+        y = (y - mean) / std
         loss = 0.0
         # 11. 保存中间层特征，避免重复计算
         x_features = []
@@ -191,3 +201,10 @@ class CustomLoss(torch.nn.Module):
             
         # 15. 归一化损失，使其不会因为层数增加而过大
         return loss / sum(weights)
+    
+
+def color_mean_loss(pred, target):
+    # 计算RGB三个通道均值之间的差距（颜色引导）
+    pred_mean = pred.mean(dim=(2, 3))
+    target_mean = target.mean(dim=(2, 3))
+    return F.l1_loss(pred_mean, target_mean)

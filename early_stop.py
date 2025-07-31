@@ -15,10 +15,11 @@ class EarlyStopping:
 
     def __call__(self, val_loss):
         if val_loss < self.best_loss - self.delta:
+            resloss = self.best_loss
             self.best_loss = val_loss
             self.counter = 0
             if self.verbose:
-                print(f"Validation loss improved to {val_loss:.5f}")
+                print(f"Validation loss from {resloss:.5f} improved to {val_loss:.5f}")
         else:
             self.counter += 1
             if self.verbose:
