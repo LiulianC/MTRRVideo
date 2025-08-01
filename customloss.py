@@ -69,10 +69,8 @@ class CustomLoss(torch.nn.Module):
         Rcmaps_vgg_loss = self.compute_perceptual_loss(RCMap_test_img, I_R_diff) * self.vgg_loss_weight
         Rcmaps_ssim_loss = (1 - self.ssim_metric(RCMap_test_img, I_R_diff)) * self.ssim_loss_weight
         Rcmaps_color_loss = color_mean_loss(RCMap_test_img, I_R_diff) * self.color_loss_weight
-        epsilon = 1e-8
-        Rcmaps_entropy_loss = -torch.mean(
-            rcmaps * torch.log(rcmaps + epsilon) + (1 - rcmaps) * torch.log(1 - rcmaps + epsilon)
-        ) # 放在mse loss里
+        
+        Rcmaps_l1_loss = torch.mean(torch.abs(rcmaps)) /3 * 0.2
 
         
         # 总和检测
@@ -89,7 +87,7 @@ class CustomLoss(torch.nn.Module):
             fake_T_mse_loss * self.fake_T_weight + 
             Rcmaps_mse_loss * self.Rcmaps_weight + 
             all_img_mse_loss * self.all_img_weight +
-            Rcmaps_entropy_loss
+            Rcmaps_l1_loss
         )
         
         # 7. VGG损失除以5

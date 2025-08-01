@@ -313,7 +313,7 @@ class RDM(nn.Module):
         self.se7 = SEResidualBlock(channel=18, se_reduction=6, res_scale=0.1)
 
         # Output
-        self.out_head = Conv2DLayer(in_channels=18,out_channels=1,kernel_size=1,padding=0,stride=1,bias=False)          
+        self.out_head = Conv2DLayer(in_channels=18,out_channels=3,kernel_size=1,padding=0,stride=1,bias=False)          
         
         self.tanh = nn.Tanh()
         
@@ -335,7 +335,7 @@ class RDM(nn.Module):
         x_se = self.se6(x_se)
         x_se = self.se7(x_se)
 
-        out = self.out_head(x_se) # (B,1,256,256)
+        out = self.out_head(x_se) # (B,3,256,256)
         out = (self.tanh(out)+1)/2
         return out,xd8,xd4,xd2
 
@@ -618,6 +618,7 @@ class SubNet(nn.Module):
         self.m = MambaSwinBlock(in_channels=6, out_channels=6, img_size=(256,256), patch_size=4 , embed_dim=192 , input_resolution=(64 , 64), window_size=8, swin_blocks=0, mamba_blocks=10)
 
         # Level 0: 
+        self.aaf0 = AAF(in_channels=in_dims[0], num_inputs=2)
 
         # Level 1: c0和c2融合
         self.aaf1 = AAF(in_channels=in_dims[0], num_inputs=2)
@@ -649,13 +650,13 @@ class SubNet(nn.Module):
             data.abs_().clamp_(value) # 将输入张量 data 的每个元素的绝对值限制在 [value, +∞) 范围内
             data *= sign
         
-    def forward(self, c0, c1, c2, c3):
+    def forward(self, x, c0, c1, c2, c3):
         self._clamp_abs(self.alpha0.data, 1e-3) 
         self._clamp_abs(self.alpha1.data, 1e-3)
         self._clamp_abs(self.alpha2.data, 1e-3)
         self._clamp_abs(self.alpha3.data, 1e-3)
         
-        c0 = self.safe_add(self.alpha0 * c0, self.m(c1))
+        c0 = self.safe_add(self.alpha0 * c0, self.m(self.aaf1([x, c1])))
         c1 = self.safe_add(self.alpha1 * c1, self.m(self.aaf1([c0, c2])))
         c2 = self.safe_add(self.alpha2 * c2, self.m(self.aaf2([c1, c3])))
         c3 = self.safe_add(self.alpha3 * c3, self.m(c2))
@@ -714,13 +715,13 @@ class MTRRNet(nn.Module):
         # input_resolution要是window_size的倍数
         # input H/W 推荐是 patch_size 和 window_size 的公倍数
         # 输入256*256
-        self.encoder0 = MambaSwinBlock(in_channels=4, out_channels=3, img_size=(256,256), patch_size=4 , embed_dim=96 , input_resolution=(64 , 64), window_size=8, swin_blocks=4, mamba_blocks=10) # 最细节的
+        self.encoder0 = MambaSwinBlock(in_channels=3, out_channels=3, img_size=(256,256), patch_size=4 , embed_dim=96 , input_resolution=(64 , 64), window_size=8, swin_blocks=4, mamba_blocks=10) # 最细节的
         # 输入128*128
-        self.encoder1 = MambaSwinBlock(in_channels=4, out_channels=3, img_size=(128,128), patch_size=8 , embed_dim=96, input_resolution=(16 , 16), window_size=8, swin_blocks=4, mamba_blocks=10)
+        self.encoder1 = MambaSwinBlock(in_channels=3, out_channels=3, img_size=(128,128), patch_size=8 , embed_dim=192, input_resolution=(16 , 16), window_size=8, swin_blocks=4, mamba_blocks=10)
         # 输入64*64
-        self.encoder2 = MambaSwinBlock(in_channels=4, out_channels=3, img_size=(64 , 64), patch_size=4 , embed_dim=96 , input_resolution=(16 , 16), window_size=8, swin_blocks=4, mamba_blocks=10)
+        self.encoder2 = MambaSwinBlock(in_channels=3, out_channels=3, img_size=(64 , 64), patch_size=4 , embed_dim=96 , input_resolution=(16 , 16), window_size=8, swin_blocks=4, mamba_blocks=10)
         # 输入32*32
-        self.encoder3 = MambaSwinBlock(in_channels=4, out_channels=3, img_size=(32 , 32), patch_size=2 , embed_dim=96 , input_resolution=(16 , 16), window_size=4, swin_blocks=4, mamba_blocks=10)
+        self.encoder3 = MambaSwinBlock(in_channels=3, out_channels=3, img_size=(32 , 32), patch_size=2 , embed_dim=96 , input_resolution=(16 , 16), window_size=4, swin_blocks=4, mamba_blocks=10)
 
         # 特征通道适配
         self.c0_adapter = nn.Sequential(
@@ -762,17 +763,21 @@ class MTRRNet(nn.Module):
 
     def forward(self, x_in):
         # x_in = self.norm_first(x_in)
-        rmap,x_down8,x_down4,x_down2 = self.rdm(x_in)  # 提取反光区域图
+        rmap,x_down8,x_down4,x_down2 = self.rdm(x_in)  # 提取反光区域图 都是c=3
         x_down1 = x_in
 
         rmapd2 = F.interpolate(rmap, scale_factor=0.5, mode='bicubic')
         rmapd4 = F.interpolate(rmap, scale_factor=0.25, mode='bicubic')
         rmapd8 = F.interpolate(rmap, scale_factor=0.125, mode='bicubic')# 下采样到 1/8
 
-        x_down1 = torch.cat([x_down1, rmap], dim=1)  # B, 4, 128, 128
-        x_down2 = torch.cat([x_down2, rmapd2], dim=1)
-        x_down4 = torch.cat([x_down4, rmapd4], dim=1)
-        x_down8 = torch.cat([x_down8, rmapd8], dim=1)  # B, 4, 32, 32
+        # x_down1 = torch.cat([x_down1, rmap], dim=1)  # B, 4, 128, 128
+        # x_down2 = torch.cat([x_down2, rmapd2], dim=1)
+        # x_down4 = torch.cat([x_down4, rmapd4], dim=1)
+        # x_down8 = torch.cat([x_down8, rmapd8], dim=1)  # B, 4, 32, 32
+        x_down1 = x_down1 * rmap    # B, 4, 128, 128
+        x_down2 = x_down2 * rmapd2
+        x_down4 = x_down4 * rmapd4
+        x_down8 = x_down8 * rmapd8  # B, 4, 32, 32
 
         x_down1 = self.encoder0(x_down1)
         x_down2 = self.encoder1(x_down2)
@@ -791,19 +796,19 @@ class MTRRNet(nn.Module):
         c3 = self.c3_adapter(x_down8)
 
         # # 四层子网络增强
-        # c0, c1, c2, c3 = self.subnet0(c0, c1, c2, c3)
-        # c0, c1, c2, c3 = self.subnet1(c0, c1, c2, c3)
-        # c0, c1, c2, c3 = self.subnet2(c0, c1, c2, c3)
-        # c0, c1, c2, c3 = self.subnet3(c0, c1, c2, c3) # 都是6通道的
+        # c0, c1, c2, c3 = self.subnet0(x, c0, c1, c2, c3)
+        # c0, c1, c2, c3 = self.subnet1(x, c0, c1, c2, c3)
+        # c0, c1, c2, c3 = self.subnet2(x, c0, c1, c2, c3)
+        # c0, c1, c2, c3 = self.subnet3(x, c0, c1, c2, c3) # 都是6通道的
 
-        c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet0, c0, c1, c2, c3)
-        c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet1, c0, c1, c2, c3)
-        c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet2, c0, c1, c2, c3)
-        c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet3, c0, c1, c2, c3)        
+        c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet0, rmap, c0, c1, c2, c3)
+        c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet1, rmap, c0, c1, c2, c3)
+        c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet2, rmap, c0, c1, c2, c3)
+        c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet3, rmap, c0, c1, c2, c3)        
 
         # 解码重建残差图
         # out = torch.cat([x_in,x_in],dim=1) + self.decoder1(c0, c1, c2, c3)
-        out = torch.cat([x_in,x_in],dim=1) + self.decoder2(x_in, c0, c1, c2, c3)
+        out = torch.cat([x_in,x_in],dim=1) + self.decoder2(rmap, c0, c1, c2, c3)
         # out = torch.cat([x_in,x_in],dim=1) + (c0)
 
         return rmap, out   

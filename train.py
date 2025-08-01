@@ -386,14 +386,14 @@ if __name__ == '__main__':
         avg_test_psnr = total_test_psnr / total_test_step
         avg_test_ssim = total_test_ssim / total_test_step
         if avg_test_psnr > max_psnr:
-            max_psnr = avg_test_psnr
             print(f"psnr from {max_psnr:.5f} improve {avg_test_psnr:.5f} ")
+            max_psnr = avg_test_psnr
         else:
             print(f"psnr did not improve : best {max_psnr:.5f} now {avg_test_psnr:.5f} ")
             
         if avg_test_ssim > max_ssim:
-            max_ssim = avg_test_ssim
             print(f"ssim from {max_ssim:.5f} improve {avg_test_ssim:.5f} ")
+            max_ssim = avg_test_ssim
         else:
             print(f"ssim did not improve : best {max_ssim:.5f} now {avg_test_ssim:.5f} ")
         
