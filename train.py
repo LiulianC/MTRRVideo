@@ -23,6 +23,7 @@ from dataset.new_dataset1 import *
 from torch import amp
 scaler = amp.GradScaler()
 from set_seed import set_seed 
+from fix_mamba_init import apply_improved_init  # 导入改进的初始化
 
 
 warnings.filterwarnings('ignore')
@@ -37,16 +38,18 @@ opts.batch_size = 4
 opts.shuffle = False
 opts.display_id = -1
 opts.num_workers = 0
-opts.debug_monitor_layer_stats = True # debug模式开启时 epoch和size都要为1 要load模型 可同时打开
-opts.debug_monitor_layer_grad = True # # debug模式开启时 epoch和size都要为1 要load模型bash
+
+opts.always_print = 1
+opts.debug_monitor_layer_stats = 1 # debug模式开启时 epoch和size都要为1 要load模型 可同时打开
+opts.debug_monitor_layer_grad = 1 # # debug模式开启时 epoch和size都要为1 要load模型bash
 opts.draw_attention_map = False # 注册cbam钩子 画注意力热力图 训练数据集要改 epoch和size都要为1 要load模型 batchsize要改1
 opts.sampler_size1 = 0
 opts.sampler_size2 = 0
 opts.sampler_size3 = 800
 opts.test_size = [200,0,0]
-opts.epoch = 100
+opts.epoch = 40
 opts.model_path='./model_fit/model_latest.pth'  
-opts.model_path=None  #如果要load就注释我
+# opts.model_path=None  #如果要load就注释我
 current_lr = 1e-4 # 不可大于1e-5 否则会引起深层网络的梯度爆炸
 
 # nohup /home/gzm/cp310pt26/bin/python /home/gzm/gzm-MTRRVideo/train.py > /home/gzm/gzm-MTRRVideo/project.log 2>&1 &
@@ -54,6 +57,9 @@ current_lr = 1e-4 # 不可大于1e-5 否则会引起深层网络的梯度爆炸
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = MTRREngine(opts, device)
 # model.count_parameters()
+# 应用改进的初始化
+print("Applying improved initialization...")
+model.netG_T = apply_improved_init(model.netG_T)
 
 if opts.debug_monitor_layer_stats or opts.debug_monitor_layer_grad:
     opts.epoch = 100
@@ -150,7 +156,7 @@ if __name__ == '__main__':
         optimizer,
         mode='min',           # 监控的 quantity 是 loss，我们希望它减小
         factor=0.5,           # 学习率乘以 0.5
-        patience=3,           # 等待 4 个 epoch 没有 improvement 后才触发 LR 衰减
+        patience=7,           # 等待 4 个 epoch 没有 improvement 后才触发 LR 衰减
         threshold=1e-4,       # 可选：认为 loss 没有显著下降的阈值
         threshold_mode='rel', # 使用相对阈值
         cooldown=0,           # 每次衰减后冷却期（可不设）
@@ -195,6 +201,10 @@ if __name__ == '__main__':
             bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]"
         )        
         for t, data1 in enumerate(train_pbar):
+            # print('\n')
+            # print('input mean:',data1['input'].mean())
+            # print('input std:',data1['input'].std())
+            # print('input shape:',data1['input'].shape)
             model.set_input(data1)
             train_file_name = str(data1['fn']) 
 
@@ -360,7 +370,7 @@ if __name__ == '__main__':
                     test_fake_TList = visuals_test['fake_T']
                     test_fake_TList_cat = test_fake_TList
                     save_image(test_fake_TList_cat, os.path.join(output_dir6, f'epoch{i}+{total_test_step}-test_fakeT.png'), nrow=4)
-                    torch.save(test_fake_TList_cat,os.path.join(output_dir6,f'epoch{i}+{total_test_step}+fakeT-tensor.pt'))
+                    # torch.save(test_fake_TList_cat,os.path.join(output_dir6,f'epoch{i}+{total_test_step}+fakeT-tensor.pt'))
 
                     test_fake_RList = visuals_test['fake_R']
                     test_fake_RList_cat = test_fake_RList

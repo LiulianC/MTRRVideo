@@ -12,7 +12,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from classifier import PretrainedConvNext_e2e
-from nafblock import NAFBlock2 as NAFBlock
 # from nafblock import NAFBlock
 import torch.utils.checkpoint as checkpoint
 import math
@@ -347,32 +346,22 @@ class RDM(nn.Module):
 class MambaBlock2D(nn.Module):
     def __init__(self, dim, num_blocks=1):
         super().__init__()
-        # 初始归一化层
-        self.norm_first = nn.LayerNorm(dim)
         
         # 创建多个Mamba块
         self.blocks = nn.ModuleList()
         for _ in range(num_blocks):
             self.blocks.append(nn.Sequential(
-                nn.LayerNorm(dim),  # 每个块有自己的归一化
+                nn.LayerNorm(dim),  # 恢复LayerNorm，稳定训练
                 Mamba(dim)
             ))
-        # 投影层保持不变
-        # self.proj = nn.Sequential(
-        #     nn.LayerNorm(dim),
-        #     nn.GELU()
-        # )
-
 
     def forward(self, x_emb):# x_emb (B,L,C) 
 
-        x_emb = self.norm_first(x_emb)
-        x_emb = torch.clamp(x_emb, -10.0, 10.0)
-        with torch.amp.autocast('cuda',enabled=False):
+        with torch.amp.autocast('cuda',enabled=True):
+            x_emb = torch.clamp(x_emb, -10.0, 10.0)
             for block in self.blocks:
                 res = x_emb
-                x_emb = block(x_emb)* 0.5 + res 
-        # x_mam = self.proj(x_mam)
+                x_emb = block(x_emb)* 0.5 + res  # 改为0.5，减少信息衰减
 
         return x_emb # (B,L,C)
 
@@ -387,13 +376,11 @@ class ResidualSwinBlock(nn.Module):
         self.shift_size = shift_size
         self.swin_blocks = swin_blocks
 
-        
-        self.norm = nn.LayerNorm(dim)  
 
         self.blocks = nn.ModuleList()
         for _ in range(swin_blocks):
             self.blocks.append(nn.Sequential(
-                nn.LayerNorm(dim),  # 每个块有自己的归一化
+                nn.LayerNorm(dim),  # 恢复LayerNorm，稳定训练
                 SwinTransformerBlock(
                     dim=dim,
                     input_resolution=input_resolution,
@@ -411,11 +398,10 @@ class ResidualSwinBlock(nn.Module):
         if self.window_size //2 != self.shift_size:
             print(f"Warning: Window size {self.window_size} and shift size {self.shift_size} are not compatible.")
 
-        x_emb = self.norm(x_emb)             # 归一化
         x_emb = torch.clamp(x_emb, -10.0, 10.0)
         res = x_emb
         for block in self.blocks:
-            x_emb = block(x_emb)*0.5 + res
+            x_emb = block(x_emb)*0.5 + res  # 改为0.5，减少信息衰减
 
 
         return x_emb # token (B, H/4, W/4, embedim)
@@ -557,8 +543,8 @@ class MambaSwinBlock(nn.Module):
         if self.img_size[0] != self.patch_size * self.input_resolution[0]:
             print('Warning: wrong size! input_resolution should be imgsize/patchsize')
 
-        x = self.norm_act(x)
-        x = torch.clamp(x, -10.0, 10.0)
+        # x = self.norm_act(x)
+        # x = torch.clamp(x, -10.0, 10.0)
         b,c,h,w = x.shape
         x_emb = self.patch_embed(x) # flatten False x_emb(B,C,H,W)
         B,C,H,W = x_emb.shape
@@ -693,7 +679,7 @@ class Decoder2(nn.Module):
         x = self.norm(x)
         x = self.m(x*c1)
         x = self.norm(x)
-        x_in = torch.cat([x_in,x_in],dim=1)
+        # x_in = torch.cat([x_in,x_in],dim=1)
         x = self.m(x_in*c0)
 
         return x
@@ -766,6 +752,8 @@ class MTRRNet(nn.Module):
         rmap,x_down8,x_down4,x_down2 = self.rdm(x_in)  # 提取反光区域图 都是c=3
         x_down1 = x_in
 
+        rmap = 1-rmap  # 反光区域图取反才是抑制反光
+
         rmapd2 = F.interpolate(rmap, scale_factor=0.5, mode='bicubic')
         rmapd4 = F.interpolate(rmap, scale_factor=0.25, mode='bicubic')
         rmapd8 = F.interpolate(rmap, scale_factor=0.125, mode='bicubic')# 下采样到 1/8
@@ -774,20 +762,20 @@ class MTRRNet(nn.Module):
         # x_down2 = torch.cat([x_down2, rmapd2], dim=1)
         # x_down4 = torch.cat([x_down4, rmapd4], dim=1)
         # x_down8 = torch.cat([x_down8, rmapd8], dim=1)  # B, 4, 32, 32
-        x_down1 = x_down1 * rmap    # B, 4, 128, 128
-        x_down2 = x_down2 * rmapd2
-        x_down4 = x_down4 * rmapd4
-        x_down8 = x_down8 * rmapd8  # B, 4, 32, 32
+        # x_down1 = x_down1 * rmap    # B, 4, 128, 128
+        # x_down2 = x_down2 * rmapd2
+        # x_down4 = x_down4 * rmapd4
+        # x_down8 = x_down8 * rmapd8  # B, 4, 32, 32
 
-        x_down1 = self.encoder0(x_down1)
-        x_down2 = self.encoder1(x_down2)
-        x_down4 = self.encoder2(x_down4)
-        x_down8 = self.encoder3(x_down8)
+        # x_down1 = self.encoder0(x_down1)
+        # x_down2 = self.encoder1(x_down2)
+        # x_down4 = self.encoder2(x_down4)
+        # x_down8 = self.encoder3(x_down8)
 
-        # x_down1 = checkpoint.checkpoint(self.encoder0, x_down1)
-        # x_down2 = checkpoint.checkpoint(self.encoder1, x_down2)
-        # x_down4 = checkpoint.checkpoint(self.encoder2, x_down4)
-        # x_down8 = checkpoint.checkpoint(self.encoder3, x_down8)
+        x_down1 = checkpoint.checkpoint(self.encoder0, x_down1)
+        x_down2 = checkpoint.checkpoint(self.encoder1, x_down2)
+        x_down4 = checkpoint.checkpoint(self.encoder2, x_down4)
+        x_down8 = checkpoint.checkpoint(self.encoder3, x_down8)
 
         # 通道和分辨率转换
         c0 = self.c0_adapter(x_down1) # 全变成 c=6
@@ -796,22 +784,33 @@ class MTRRNet(nn.Module):
         c3 = self.c3_adapter(x_down8)
 
         # # 四层子网络增强
+        x = torch.cat([x_in,x_in],dim=1)
         # c0, c1, c2, c3 = self.subnet0(x, c0, c1, c2, c3)
         # c0, c1, c2, c3 = self.subnet1(x, c0, c1, c2, c3)
         # c0, c1, c2, c3 = self.subnet2(x, c0, c1, c2, c3)
         # c0, c1, c2, c3 = self.subnet3(x, c0, c1, c2, c3) # 都是6通道的
 
-        c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet0, rmap, c0, c1, c2, c3)
-        c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet1, rmap, c0, c1, c2, c3)
-        c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet2, rmap, c0, c1, c2, c3)
-        c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet3, rmap, c0, c1, c2, c3)        
+        # rmap2 = rmap*x_in
+        # rmap2 = torch.cat([rmap2,rmap2],dim=1)
+ 
+        c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet0, x, c0, c1, c2, c3)
+        c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet1, x, c0, c1, c2, c3)
+        c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet2, x, c0, c1, c2, c3)
+        c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet3, x, c0, c1, c2, c3)    
+        #     
+        # c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet0, rmap2, c0, c1, c2, c3)
+        # c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet1, rmap2, c0, c1, c2, c3)
+        # c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet2, rmap2, c0, c1, c2, c3)
+        # c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet3, rmap2, c0, c1, c2, c3)        
 
         # 解码重建残差图
-        # out = torch.cat([x_in,x_in],dim=1) + self.decoder1(c0, c1, c2, c3)
-        out = torch.cat([x_in,x_in],dim=1) + self.decoder2(rmap, c0, c1, c2, c3)
+        # 修复：使用x_in初始化两个通道，避免fake_R无法学习
+        out = torch.cat([x_in, x_in * 0.1],dim=1) + self.decoder2(x, c0, c1, c2, c3)
         # out = torch.cat([x_in,x_in],dim=1) + (c0)
+        # out = self.decoder2(rmap2, c0, c1, c2, c3)
+        # out = self.decoder1(c0, c1, c2, c3)
 
-        return rmap, out   
+        return rmap, out
 
  
 
@@ -840,9 +839,17 @@ class MTRREngine(nn.Module):
             self.netG_T.load_state_dict({k.replace('netG_T.', ''): v for k, v in model_state['netG_T'].items()})
 
             if 'optimizer_state_dict' in model_state:
-                optimizer.load_state_dict(model_state['optimizer_state_dict'])
-                for param_group in optimizer.param_groups:
-                    param_group['lr'] = model_state['lr']
+                try:
+                    optimizer.load_state_dict(model_state['optimizer_state_dict'])
+                    for param_group in optimizer.param_groups:
+                        param_group['lr'] = model_state.get('lr', param_group['lr'])
+                except ValueError as e:
+                    print(f"Warning: Could not load optimizer state due to: {e}")
+                    print("Continuing with fresh optimizer state")
+                    # 只设置学习率，不加载整个state
+                    if 'lr' in model_state:
+                        for param_group in optimizer.param_groups:
+                            param_group['lr'] = model_state['lr']
 
             epoch = model_state.get('epoch', None)
             print('Loaded model at epoch %d' % (epoch+1) if epoch is not None else 'Loaded model without epoch info')
@@ -889,7 +896,7 @@ class MTRREngine(nn.Module):
                 std = output.std().item()
 
                 is_nan = math.isnan(mean) or math.isnan(std)
-                if is_nan:
+                if is_nan or self.opts.always_print:
                     msg = f"{layer_name:<50} | Mean: {mean:>15.6f} | Std: {std:>15.6f} | Shape: {tuple(output.shape)}"
                     print(msg)
                     with open('./debug/state.log', 'a') as f:
@@ -911,7 +918,7 @@ class MTRREngine(nn.Module):
 
                 if param.grad is not None:
                     is_nan = math.isnan(param.grad.mean().item()) or math.isnan(param.grad.std().item())
-                    if is_nan:
+                    if is_nan or self.opts.always_print:
                         if param.grad is not None:
                             msg = (
                                 f"Param: {name:<50} | "

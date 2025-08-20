@@ -12,7 +12,7 @@ class CustomLoss(torch.nn.Module):
         else:
             self.device = torch.device("cpu")
             
-        self.ssim_metric = StructuralSimilarityIndexMeasure(data_range=1.0)
+        self.ssim_metric = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
         self.psnr_metric = PeakSignalNoiseRatio().to(self.device)
         
         # 1. 预先加载VGG模型并固定参数，避免重复加载
@@ -63,7 +63,7 @@ class CustomLoss(torch.nn.Module):
         # Rcmaps检测，使用更安全的方式计算
         # 5. 使用torch.clamp的同时注意梯度流
         I_R_diff = torch.clamp(input_image - label1, 0.0, 1.0)
-        RCMap_test_img = torch.clamp((1-rcmaps) * input_image, 0.0, 1.0)
+        RCMap_test_img = torch.clamp((rcmaps) * input_image, 0.0, 1.0)
         
         Rcmaps_mse_loss = F.mse_loss(RCMap_test_img, I_R_diff) * self.mse_loss_weight
         Rcmaps_vgg_loss = self.compute_perceptual_loss(RCMap_test_img, I_R_diff) * self.vgg_loss_weight
