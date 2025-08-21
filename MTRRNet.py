@@ -767,15 +767,15 @@ class MTRRNet(nn.Module):
         # x_down4 = x_down4 * rmapd4
         # x_down8 = x_down8 * rmapd8  # B, 4, 32, 32
 
-        # x_down1 = self.encoder0(x_down1)
-        # x_down2 = self.encoder1(x_down2)
-        # x_down4 = self.encoder2(x_down4)
-        # x_down8 = self.encoder3(x_down8)
+        x_down1 = self.encoder0(x_down1)
+        x_down2 = self.encoder1(x_down2)
+        x_down4 = self.encoder2(x_down4)
+        x_down8 = self.encoder3(x_down8)
 
-        x_down1 = checkpoint.checkpoint(self.encoder0, x_down1)
-        x_down2 = checkpoint.checkpoint(self.encoder1, x_down2)
-        x_down4 = checkpoint.checkpoint(self.encoder2, x_down4)
-        x_down8 = checkpoint.checkpoint(self.encoder3, x_down8)
+        # x_down1 = checkpoint.checkpoint(self.encoder0, x_down1)
+        # x_down2 = checkpoint.checkpoint(self.encoder1, x_down2)
+        # x_down4 = checkpoint.checkpoint(self.encoder2, x_down4)
+        # x_down8 = checkpoint.checkpoint(self.encoder3, x_down8)
 
         # 通道和分辨率转换
         c0 = self.c0_adapter(x_down1) # 全变成 c=6
@@ -796,7 +796,7 @@ class MTRRNet(nn.Module):
         c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet0, x, c0, c1, c2, c3)
         c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet1, x, c0, c1, c2, c3)
         c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet2, x, c0, c1, c2, c3)
-        c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet3, x, c0, c1, c2, c3)    
+        # c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet3, x, c0, c1, c2, c3)    
         #     
         # c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet0, rmap2, c0, c1, c2, c3)
         # c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet1, rmap2, c0, c1, c2, c3)
@@ -898,7 +898,7 @@ class MTRREngine(nn.Module):
                 is_nan = math.isnan(mean) or math.isnan(std)
                 if is_nan or self.opts.always_print:
                     msg = f"{layer_name:<50} | Mean: {mean:>15.6f} | Std: {std:>15.6f} | Shape: {tuple(output.shape)}"
-                    print(msg)
+                    # print(msg)
                     with open('./debug/state.log', 'a') as f:
                         f.write(msg + '\n')# 修正钩子函数参数（正确接收module, input, output）
       
@@ -927,7 +927,7 @@ class MTRREngine(nn.Module):
                             )
                         else:
                             msg = f"Param: {name:<50} | Grad is None"  # 梯度未回传  
-                        print(msg)
+                        # print(msg)
                         f.write(msg + '\n')
 
     def apply_weight_constraints(self):
