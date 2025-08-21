@@ -234,8 +234,8 @@ if __name__ == '__main__':
             train_fake_Rs = visuals['fake_R'].to(device)
             train_rcmaps =  visuals['c_map'].to(device)
  
-            with amp.autocast(device_type='cuda'):
-                loss_table, mse_loss, vgg_loss, ssim_loss, color_loss, all_loss = loss_function(train_fake_Ts, train_label1, train_ipt, train_rcmaps, train_fake_Rs, train_label2)
+            # with amp.autocast(device_type='cuda'):
+            loss_table, mse_loss, vgg_loss, ssim_loss, color_loss, all_loss = loss_function(train_fake_Ts, train_label1, train_ipt, train_rcmaps, train_fake_Rs, train_label2)
             total_train_loss +=all_loss.item()
 
             if torch.isnan(all_loss):
@@ -257,12 +257,17 @@ if __name__ == '__main__':
 
 
             optimizer.zero_grad()
-            scaler.scale(all_loss).backward()
+            # scaler.scale(all_loss).backward()
+            all_loss.backward()
+
             # 防止梯度爆炸
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             torch.nn.utils.clip_grad_value_(model.parameters(), clip_value=1.0)
-            scaler.step(optimizer)
-            scaler.update()            
+
+            # scaler.step(optimizer)
+            # scaler.update()            
+            optimizer.step()
+
             # 打印每层梯度
             if opts.debug_monitor_layer_grad :
                 model.monitor_layer_grad()

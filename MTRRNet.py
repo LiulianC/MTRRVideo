@@ -50,9 +50,9 @@ class AAF(nn.Module):
         
         # 输入 concat 后通道为 C*num_inputs
         self.attn = nn.Sequential(
-            nn.Conv2d(in_channels * num_inputs, in_channels * num_inputs * 16, kernel_size=1, bias=False),
+            nn.Conv2d(num_inputs * in_channels, num_inputs * in_channels * 16, kernel_size=1, bias=False),
             nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels * num_inputs * 16, in_channels * num_inputs, kernel_size=1, bias=False),
+            nn.Conv2d(num_inputs * in_channels * 16, num_inputs, kernel_size=1, bias=False),
             nn.Softmax(dim=1)  # 对每个位置的 num_inputs 做归一化
         )
 
@@ -361,7 +361,7 @@ class MambaBlock2D(nn.Module):
             x_emb = torch.clamp(x_emb, -10.0, 10.0)
             for block in self.blocks:
                 res = x_emb
-                x_emb = block(x_emb)* 0.5 + res  # 改为0.5，减少信息衰减
+                x_emb = block(x_emb)* 0.9 + res  # 改为0.5，减少信息衰减
 
         return x_emb # (B,L,C)
 
@@ -401,7 +401,7 @@ class ResidualSwinBlock(nn.Module):
         x_emb = torch.clamp(x_emb, -10.0, 10.0)
         res = x_emb
         for block in self.blocks:
-            x_emb = block(x_emb)*0.5 + res  # 改为0.5，减少信息衰减
+            x_emb = block(x_emb)*0.9 + res  # 改为0.5，减少信息衰减
 
 
         return x_emb # token (B, H/4, W/4, embedim)
