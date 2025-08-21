@@ -357,11 +357,11 @@ class MambaBlock2D(nn.Module):
 
     def forward(self, x_emb):# x_emb (B,L,C) 
 
-        with torch.amp.autocast('cuda',enabled=True):
-            x_emb = torch.clamp(x_emb, -10.0, 10.0)
-            for block in self.blocks:
-                res = x_emb
-                x_emb = block(x_emb)* 0.9 + res  # 改为0.5，减少信息衰减
+        # with torch.amp.autocast('cuda',enabled=True):
+        x_emb = torch.clamp(x_emb, -10.0, 10.0)
+        for block in self.blocks:
+            res = x_emb
+            x_emb = block(x_emb)* 0.9 + res  # 改为0.5，减少信息衰减
 
         return x_emb # (B,L,C)
 

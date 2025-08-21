@@ -169,14 +169,14 @@ class CustomLoss(torch.nn.Module):
         y_features = []
         
         # 提取特征但不计算梯度
-        with torch.no_grad():
+        with torch.enable_grad():
             for i, layer in enumerate(self.vgg):
                 x = layer(x)
                 y = layer(y)
                 
                 if i in self.feature_layers:
-                    x_features.append(x.detach())
-                    y_features.append(y.detach())
+                    x_features.append(x)
+                    y_features.append(y)
                     
                 if i >= max(self.feature_layers):
                     break
@@ -187,8 +187,8 @@ class CustomLoss(torch.nn.Module):
         # 13. 使用MSE而非L1损失，提高稳定性
         for idx, (x_feat, y_feat) in enumerate(zip(x_features, y_features)):
             # 重新启用梯度计算
-            x_feat = x_feat.detach().requires_grad_(True)
-            y_feat = y_feat.detach()
+            x_feat = x_feat.requires_grad_(True)
+            y_feat = y_feat
             
             # 使用均方误差并添加数值稳定性
             feat_diff = F.mse_loss(x_feat, y_feat)
