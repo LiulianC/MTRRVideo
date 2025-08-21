@@ -24,6 +24,8 @@ from torch import amp
 scaler = amp.GradScaler()
 from set_seed import set_seed 
 from fix_mamba_init import apply_improved_init  # 导入改进的初始化
+import torch
+torch.autograd.set_detect_anomaly(True)
 
 
 warnings.filterwarnings('ignore')
@@ -261,8 +263,8 @@ if __name__ == '__main__':
             all_loss.backward()
 
             # 防止梯度爆炸
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            torch.nn.utils.clip_grad_value_(model.parameters(), clip_value=1.0)
+            # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            # torch.nn.utils.clip_grad_value_(model.parameters(), clip_value=1.0)
 
             # scaler.step(optimizer)
             # scaler.update()            

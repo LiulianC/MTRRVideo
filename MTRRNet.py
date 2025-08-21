@@ -15,6 +15,7 @@ from classifier import PretrainedConvNext_e2e
 # from nafblock import NAFBlock
 import torch.utils.checkpoint as checkpoint
 import math
+from timm.layers import LayerNorm2d
 
 
 # padding是边缘复制 减少边框伪影
@@ -149,7 +150,7 @@ class ChannelAttention(nn.Module):
 
     def forward(self, x):
 
-        x = torch.clamp(x, -10.0, 10.0)  # 限制极值
+        # x = torch.clamp(x, -10.0, 10.0)  # 限制极值
         avg_output = self.fc(torch.tanh(self.avg_pool(x)) * 3)
         max_output = self.fc(torch.tanh(self.max_pool(x)) * 3)
 
@@ -358,10 +359,10 @@ class MambaBlock2D(nn.Module):
     def forward(self, x_emb):# x_emb (B,L,C) 
 
         # with torch.amp.autocast('cuda',enabled=True):
-        x_emb = torch.clamp(x_emb, -10.0, 10.0)
+        # x_emb = torch.clamp(x_emb, -10.0, 10.0)
         for block in self.blocks:
             res = x_emb
-            x_emb = block(x_emb)* 0.9 + res  # 改为0.5，减少信息衰减
+            x_emb = block(x_emb) + res  # 改为0.5，减少信息衰减
 
         return x_emb # (B,L,C)
 
@@ -398,10 +399,10 @@ class ResidualSwinBlock(nn.Module):
         if self.window_size //2 != self.shift_size:
             print(f"Warning: Window size {self.window_size} and shift size {self.shift_size} are not compatible.")
 
-        x_emb = torch.clamp(x_emb, -10.0, 10.0)
+        # x_emb = torch.clamp(x_emb, -10.0, 10.0)
         res = x_emb
         for block in self.blocks:
-            x_emb = block(x_emb)*0.9 + res  # 改为0.5，减少信息衰减
+            x_emb = block(x_emb) + res  # 改为0.5，减少信息衰减
 
 
         return x_emb # token (B, H/4, W/4, embedim)
@@ -436,7 +437,8 @@ class MambaSwinBlock(nn.Module):
             patch_size=self.patch_size,       # patch 大小（4×4）
             in_chans=self.in_channels,         # 输入通道数（RGB）
             embed_dim=self.embed_dim,        # 输出 token 维度
-            flatten=False
+            flatten=False,
+            norm_layer=LayerNorm2d
         )        
 
         if self.mamba_blocks > 0:
@@ -533,8 +535,16 @@ class MambaSwinBlock(nn.Module):
                     Conv2DLayer(16, out_channels, 3, padding=1)                                # → RGB残差
                 )
 
-        self.aaf = AAF(in_channels=out_channels, num_inputs=2)  
+        # 新增：两分支的可学习缩放
+        self.gamma_mam = nn.Parameter(torch.tensor(2.0))
+        self.gamma_swin = nn.Parameter(torch.tensor(1.0))
+        # 为了在 state.log 里更易观察，包一层 Identity 让监控钩子能记录
+        self.mam_gain = nn.Identity()
+        self.swin_gain = nn.Identity()       
     
+        self.aaf = AAF(in_channels=out_channels, num_inputs=2)  
+
+
 
     def forward(self, x): # in (B,4,H,W)
         if x.shape[2] % (self.patch_size * self.window_size) !=0:
@@ -542,6 +552,7 @@ class MambaSwinBlock(nn.Module):
         
         if self.img_size[0] != self.patch_size * self.input_resolution[0]:
             print('Warning: wrong size! input_resolution should be imgsize/patchsize')
+
 
         # x = self.norm_act(x)
         # x = torch.clamp(x, -10.0, 10.0)
@@ -563,7 +574,8 @@ class MambaSwinBlock(nn.Module):
             if self.patch_size == 4:
                 x_mam = self.decoder1_mam(x_mam) # (B, 3, H, W)
             if self.patch_size == 2:
-                x_mam = self.decoder0_mam(x_mam) # (B, 3, H, W)             
+                x_mam = self.decoder0_mam(x_mam) # (B, 3, H, W)      
+            x_mam = self.mam_gain(self.gamma_mam * x_mam)           
         else:
             x_mam = torch.zeros(b,self.out_channels,h,w).to('cuda') 
 
@@ -581,7 +593,8 @@ class MambaSwinBlock(nn.Module):
             if self.patch_size == 4:
                 x_swin = self.decoder1_swin(x_swin) # (B, 3, H, W)
             if self.patch_size == 2:
-                x_swin = self.decoder0_swin(x_swin) # (B, 3, H, W)             
+                x_swin = self.decoder0_swin(x_swin) # (B, 3, H, W)      
+            x_swin = self.swin_gain(self.gamma_swin * x_swin)  # 应用缩放（可监控）           
         else:
             x_swin = torch.zeros(b,self.out_channels,h,w).to('cuda')
 
@@ -589,7 +602,7 @@ class MambaSwinBlock(nn.Module):
         # print("x_mam shape:",x_mam.shape)
         # print("x_swin shape:",x_swin.shape)
 
-        out = self.aaf([x_mam,x_swin])  # 因为块内已经残差连接 不需要总的残差连接了
+        out = self.aaf([x_mam, x_swin])  # 因为块内已经残差连接 不需要总的残差连接了
 
         return out
     
