@@ -97,10 +97,10 @@ class LaplacianPyramid(nn.Module):
 
         self.aaf = AAF(3,4)
 
-        self.conv0 = Conv2DLayer(in_channels=dim, out_channels=dim, kernel_size=3, padding=1, bias=False, norm=nn.BatchNorm2d, act=nn.GELU())
-        self.conv1 = Conv2DLayer(in_channels=dim, out_channels=dim, kernel_size=3, padding=1, bias=False, norm=nn.BatchNorm2d, act=nn.GELU())
-        self.conv2 = Conv2DLayer(in_channels=dim, out_channels=dim, kernel_size=3, padding=1, bias=False, norm=nn.BatchNorm2d, act=nn.GELU())
-        self.conv3 = Conv2DLayer(in_channels=dim, out_channels=dim, kernel_size=3, padding=1, bias=False, norm=nn.BatchNorm2d, act=nn.GELU())
+        # self.conv0 = Conv2DLayer(in_channels=dim, out_channels=dim, kernel_size=3, padding=1, bias=False, norm=nn.BatchNorm2d, act=nn.GELU())
+        # self.conv1 = Conv2DLayer(in_channels=dim, out_channels=dim, kernel_size=3, padding=1, bias=False, norm=nn.BatchNorm2d, act=nn.GELU())
+        # self.conv2 = Conv2DLayer(in_channels=dim, out_channels=dim, kernel_size=3, padding=1, bias=False, norm=nn.BatchNorm2d, act=nn.GELU())
+        # self.conv3 = Conv2DLayer(in_channels=dim, out_channels=dim, kernel_size=3, padding=1, bias=False, norm=nn.BatchNorm2d, act=nn.GELU())
 
     def forward(self, x):
         # print(self.kernel[0,0,:,:])
@@ -747,25 +747,27 @@ class MTRRNet(nn.Module):
         # 三层 SubNet，不共享参数
         self.subnet0 = SubNet(in_dims=(6, 6, 6, 6), num_layers=(2, 2, 2, 2))
         self.subnet1 = SubNet(in_dims=(6, 6, 6, 6), num_layers=(2, 2, 2, 2))
-        self.subnet2 = SubNet(in_dims=(6, 6, 6, 6), num_layers=(2, 2, 2, 2))
-        self.subnet3 = SubNet(in_dims=(6, 6, 6, 6), num_layers=(2, 2, 2, 2))
+        # self.subnet2 = SubNet(in_dims=(6, 6, 6, 6), num_layers=(2, 2, 2, 2))
+        # self.subnet3 = SubNet(in_dims=(6, 6, 6, 6), num_layers=(2, 2, 2, 2))
 
         # 解码器
         # self.decoder1 = Decoder1(6,4)
         self.decoder2 = Decoder2(in_dims=(6, 6, 6, 6), num_layers=(2, 2, 2, 2))
+
+        self.down8 = nn.Identity()
  
 
     def run_subnet0(self, *inputs): return self.subnet0(*inputs)
     def run_subnet1(self, *inputs): return self.subnet1(*inputs)
-    def run_subnet2(self, *inputs): return self.subnet2(*inputs)
-    def run_subnet3(self, *inputs): return self.subnet3(*inputs)
+    # def run_subnet2(self, *inputs): return self.subnet2(*inputs)
+    # def run_subnet3(self, *inputs): return self.subnet3(*inputs)
 
     def forward(self, x_in):
         # x_in = self.norm_first(x_in)
         rmap,x_down8,x_down4,x_down2 = self.rdm(x_in)  # 提取反光区域图 都是c=3
         x_down1 = x_in
 
-        rmap = 1-rmap  # 反光区域图取反才是抑制反光
+        # rmap = 1-rmap  # 反光区域图取反才是抑制反光
 
         rmapd2 = F.interpolate(rmap, scale_factor=0.5, mode='bicubic')
         rmapd4 = F.interpolate(rmap, scale_factor=0.25, mode='bicubic')
@@ -780,10 +782,13 @@ class MTRRNet(nn.Module):
         # x_down4 = x_down4 * rmapd4
         # x_down8 = x_down8 * rmapd8  # B, 4, 32, 32
 
+        x_down8 = self.down8(x_down8) # 观察
+
         x_down1 = self.encoder0(x_down1)
         x_down2 = self.encoder1(x_down2)
         x_down4 = self.encoder2(x_down4)
         x_down8 = self.encoder3(x_down8)
+        
 
         # x_down1 = checkpoint.checkpoint(self.encoder0, x_down1)
         # x_down2 = checkpoint.checkpoint(self.encoder1, x_down2)
@@ -803,18 +808,13 @@ class MTRRNet(nn.Module):
         # c0, c1, c2, c3 = self.subnet2(x, c0, c1, c2, c3)
         # c0, c1, c2, c3 = self.subnet3(x, c0, c1, c2, c3) # 都是6通道的
 
-        # rmap2 = rmap*x_in
-        # rmap2 = torch.cat([rmap2,rmap2],dim=1)
  
         c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet0, x, c0, c1, c2, c3)
         c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet1, x, c0, c1, c2, c3)
-        c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet2, x, c0, c1, c2, c3)
+        # c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet2, x, c0, c1, c2, c3)
         # c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet3, x, c0, c1, c2, c3)    
-        #     
-        # c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet0, rmap2, c0, c1, c2, c3)
-        # c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet1, rmap2, c0, c1, c2, c3)
-        # c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet2, rmap2, c0, c1, c2, c3)
-        # c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet3, rmap2, c0, c1, c2, c3)        
+
+
 
         # 解码重建残差图
         # 修复：使用x_in初始化两个通道，避免fake_R无法学习

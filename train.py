@@ -266,14 +266,16 @@ if __name__ == '__main__':
             # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             # torch.nn.utils.clip_grad_value_(model.parameters(), clip_value=1.0)
 
-            # scaler.step(optimizer)
-            # scaler.update()            
-            optimizer.step()
 
             # 打印每层梯度
             if opts.debug_monitor_layer_grad :
                 model.monitor_layer_grad()
 
+            # scaler.step(optimizer)
+            # scaler.update()            
+            optimizer.step()
+
+            
             total_train_step += 1
 
             if i % 10 == 0 & total_train_step % 1 == 0:
