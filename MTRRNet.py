@@ -577,8 +577,8 @@ class MambaSwinBlock(nn.Module):
                 x_mam = self.decoder0_mam(x_mam) # (B, 3, H, W)      
             x_mam = self.mam_gain(self.gamma_mam * x_mam)           
         else:
-            # x_mam = torch.zeros(b,self.out_channels,h,w).to('cuda') 
-            x_mam = x_swin 
+            x_mam = torch.zeros(b,self.out_channels,h,w).to('cuda') 
+            # x_mam = x_swin 
 
         # swin need (B,H,W,C)
         if self.swin_blocks>0:
@@ -597,16 +597,24 @@ class MambaSwinBlock(nn.Module):
                 x_swin = self.decoder0_swin(x_swin) # (B, 3, H, W)      
             x_swin = self.swin_gain(self.gamma_swin * x_swin)  # 应用缩放（可监控）           
         else:
-            # x_swin = torch.zeros(b,self.out_channels,h,w).to('cuda')
-            x_swin = x_mam
+            x_swin = torch.zeros(b,self.out_channels,h,w).to('cuda')
+            # x_swin = x_mam
 
         # print(b,c,h,w)
         # print("x_mam shape:",x_mam.shape)
         # print("x_swin shape:",x_swin.shape)
+        if self.mamba_blocks==0 and self.swin_blocks==0:
+            return torch.zeros(b,self.out_channels,h,w).to('cuda')
+        
+        if self.mamba_blocks==0 and self.swin_blocks>0:
+            return x_swin
+        
+        if self.mamba_blocks>0 and self.swin_blocks==0:
+            return x_mam
+        
+        if self.mamba_blocks>0 and self.swin_blocks>0:
+            return self.aaf([x_mam, x_swin])  # 因为块内已经残差连接 不需要总的残差连接了
 
-        out = self.aaf([x_mam, x_swin])  # 因为块内已经残差连接 不需要总的残差连接了
-
-        return out
     
 
 # --------------------------
@@ -702,17 +710,21 @@ class Decoder2(nn.Module):
         self.xc2_view = nn.Identity()
         self.xc1_view = nn.Identity()
         self.xc0_view = nn.Identity()
+
     def forward(self, x_in, c0, c1, c2, c3):
+        out0 = self.m(c3)
+        o0 = self.norm0(out0)
 
-        x = self.m(c3)
-        x = self.norm0(x)
-        x = self.m(self.xc2_view(x*c2))
-        x = self.norm1(x)
-        x = self.m(self.xc1_view(x*c1))
-        x = self.norm2(x)
-        x = self.m(self.xc0_view(x*c0))
+        out1 = self.m(o0 * c2)
+        o1 = self.norm1(out1)
 
-        return x
+        out2 = self.m(o1 * c1)
+        o2 = self.norm2(out2)
+
+        out3 = self.m(o2 * c0)
+
+        fused = (out0 + out1 + out2 + out3) / 4.0
+        return fused
 
 
 
