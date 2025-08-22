@@ -565,8 +565,8 @@ class MambaSwinBlock(nn.Module):
         if self.mamba_blocks>0:
             x_mam = x_emb.reshape(B, H*W, C)
             x_mam = self.mamba(x_mam)                               
-
             x_mam = x_mam.permute(0,2,1).reshape(B,C,H,W)
+
             if self.patch_size == 16:
                 x_mam = self.decoder3_mam(x_mam) # (B, 3, H, W)
             if self.patch_size == 8:
@@ -577,7 +577,8 @@ class MambaSwinBlock(nn.Module):
                 x_mam = self.decoder0_mam(x_mam) # (B, 3, H, W)      
             x_mam = self.mam_gain(self.gamma_mam * x_mam)           
         else:
-            x_mam = torch.zeros(b,self.out_channels,h,w).to('cuda') 
+            # x_mam = torch.zeros(b,self.out_channels,h,w).to('cuda') 
+            x_mam = x_swin 
 
         # swin need (B,H,W,C)
         if self.swin_blocks>0:
@@ -596,7 +597,8 @@ class MambaSwinBlock(nn.Module):
                 x_swin = self.decoder0_swin(x_swin) # (B, 3, H, W)      
             x_swin = self.swin_gain(self.gamma_swin * x_swin)  # 应用缩放（可监控）           
         else:
-            x_swin = torch.zeros(b,self.out_channels,h,w).to('cuda')
+            # x_swin = torch.zeros(b,self.out_channels,h,w).to('cuda')
+            x_swin = x_mam
 
         # print(b,c,h,w)
         # print("x_mam shape:",x_mam.shape)
@@ -611,10 +613,10 @@ class MambaSwinBlock(nn.Module):
 # SubNet 多尺度融合模块
 # --------------------------
 class SubNet(nn.Module):
-    def __init__(self, in_dims=(6, 6, 6, 6), num_layers=(4, 4, 4, 4)):
+    def __init__(self, in_dims=(6, 6, 6, 6), swin_num=0, mamba_num=10):
         super().__init__()
 
-        self.m = MambaSwinBlock(in_channels=6, out_channels=6, img_size=(256,256), patch_size=4 , embed_dim=192 , input_resolution=(64 , 64), window_size=8, swin_blocks=0, mamba_blocks=10)
+        self.m = MambaSwinBlock(in_channels=6, out_channels=6, img_size=(256,256), patch_size=4 , embed_dim=192 , input_resolution=(64 , 64), window_size=8, swin_blocks=swin_num, mamba_blocks=mamba_num)
 
         # Level 0: 
         self.aaf0 = AAF(in_channels=in_dims[0], num_inputs=2)
@@ -636,6 +638,11 @@ class SubNet(nn.Module):
                                    requires_grad=True) if shortcut_scale_init_value > 0 else None
         self.alpha3 = nn.Parameter(shortcut_scale_init_value * torch.ones((1, in_dims[3], 1, 1)),
                                    requires_grad=True) if shortcut_scale_init_value > 0 else None
+
+        self.c0_view = nn.Identity()
+        self.c1_view = nn.Identity()
+        self.c2_view = nn.Identity()
+        self.c3_view = nn.Identity()
     
     def safe_add(self, x, y):
         # 相同的实现
@@ -655,10 +662,15 @@ class SubNet(nn.Module):
         self._clamp_abs(self.alpha2.data, 1e-3)
         self._clamp_abs(self.alpha3.data, 1e-3)
         
-        c0 = self.safe_add(self.alpha0 * c0, self.m(self.aaf1([x, c1])))
+        c0 = self.safe_add(self.alpha0 * c0, self.m(self.aaf0([x, c1])))
         c1 = self.safe_add(self.alpha1 * c1, self.m(self.aaf1([c0, c2])))
         c2 = self.safe_add(self.alpha2 * c2, self.m(self.aaf2([c1, c3])))
         c3 = self.safe_add(self.alpha3 * c3, self.m(c2))
+
+        c0 = self.c0_view(c0)
+        c1 = self.c1_view(c1)
+        c2 = self.c2_view(c2)
+        c3 = self.c3_view(c3)
 
         return c0, c1, c2, c3
 
@@ -683,16 +695,22 @@ class Decoder2(nn.Module):
         super().__init__()
         
         self.m = MambaSwinBlock(in_channels=in_dims[0], out_channels=in_dims[0], img_size=(256,256), patch_size=4 , embed_dim=192 , input_resolution=(64 , 64), window_size=8, swin_blocks=0, mamba_blocks=num_layers[0])
-        self.norm = nn.BatchNorm2d(in_dims[0])
+        self.norm0 = nn.BatchNorm2d(in_dims[0])
+        self.norm1 = nn.BatchNorm2d(in_dims[0])
+        self.norm2 = nn.BatchNorm2d(in_dims[0])
+
+        self.xc2_view = nn.Identity()
+        self.xc1_view = nn.Identity()
+        self.xc0_view = nn.Identity()
     def forward(self, x_in, c0, c1, c2, c3):
 
         x = self.m(c3)
-        x = self.norm(x)
-        x = self.m(x*c2)
-        x = self.norm(x)
-        x = self.m(x*c1)
-        x = self.norm(x)
-        x = self.m(x*c0)
+        x = self.norm0(x)
+        x = self.m(self.xc2_view(x*c2))
+        x = self.norm1(x)
+        x = self.m(self.xc1_view(x*c1))
+        x = self.norm2(x)
+        x = self.m(self.xc0_view(x*c0))
 
         return x
 
@@ -744,8 +762,8 @@ class MTRRNet(nn.Module):
 
 
         # 三层 SubNet，不共享参数
-        self.subnet0 = SubNet(in_dims=(6, 6, 6, 6), num_layers=(2, 2, 2, 2))
-        self.subnet1 = SubNet(in_dims=(6, 6, 6, 6), num_layers=(2, 2, 2, 2))
+        self.subnet0 = SubNet(in_dims=(6, 6, 6, 6), swin_num=0, mamba_num=10)
+        self.subnet1 = SubNet(in_dims=(6, 6, 6, 6), swin_num=0, mamba_num=10)
         # self.subnet2 = SubNet(in_dims=(6, 6, 6, 6), num_layers=(2, 2, 2, 2))
         # self.subnet3 = SubNet(in_dims=(6, 6, 6, 6), num_layers=(2, 2, 2, 2))
 
