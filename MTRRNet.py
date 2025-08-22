@@ -692,8 +692,7 @@ class Decoder2(nn.Module):
         x = self.norm(x)
         x = self.m(x*c1)
         x = self.norm(x)
-        # x_in = torch.cat([x_in,x_in],dim=1)
-        x = self.m(x_in*c0)
+        x = self.m(x*c0)
 
         return x
 
