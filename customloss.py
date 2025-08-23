@@ -38,13 +38,13 @@ class CustomLoss(torch.nn.Module):
 
 
         # 3. 使用eps参数确保所有输入在有效范围内
-        eps = 1e-6
-        fake_Ts = torch.clamp(fake_Ts, eps, 1.0-eps)
-        fake_Rs = torch.clamp(fake_Rs, eps, 1.0-eps)
-        label1 = torch.clamp(label1, eps, 1.0-eps)
-        label2 = torch.clamp(label2, eps, 1.0-eps)
-        input_image = torch.clamp(input_image, eps, 1.0-eps)
-        rcmaps = torch.clamp(rcmaps, eps, 1.0-eps)
+        # eps = 1e-6
+        # fake_Ts = torch.clamp(fake_Ts, eps, 1.0-eps)
+        # fake_Rs = torch.clamp(fake_Rs, eps, 1.0-eps)
+        # label1 = torch.clamp(label1, eps, 1.0-eps)
+        # label2 = torch.clamp(label2, eps, 1.0-eps)
+        # input_image = torch.clamp(input_image, eps, 1.0-eps)
+        # rcmaps = torch.clamp(rcmaps, eps, 1.0-eps)
 
         # 计算fake_Rs的损失
         fake_R_mse_loss = F.mse_loss(fake_Rs, label2) * self.mse_loss_weight
@@ -62,8 +62,10 @@ class CustomLoss(torch.nn.Module):
 
         # Rcmaps检测，使用更安全的方式计算
         # 5. 使用torch.clamp的同时注意梯度流
-        I_R_diff = torch.clamp(input_image - label1, 0.0, 1.0)
-        RCMap_test_img = torch.clamp((rcmaps) * input_image, 0.0, 1.0)
+        # I_R_diff = torch.clamp(input_image - label1, 0.0, 1.0)
+        I_R_diff = (input_image - label1)
+        RCMap_test_img = ((rcmaps) * input_image)
+        # RCMap_test_img = torch.clamp((rcmaps) * input_image, 0.0, 1.0)
         
         Rcmaps_mse_loss = F.mse_loss(RCMap_test_img, I_R_diff) * self.mse_loss_weight
         Rcmaps_vgg_loss = self.compute_perceptual_loss(RCMap_test_img, I_R_diff) * self.vgg_loss_weight
@@ -74,7 +76,8 @@ class CustomLoss(torch.nn.Module):
 
         
         # 总和检测
-        all_img = torch.clamp(fake_Ts * rcmaps + fake_Rs, 0.0, 1.0)
+        # all_img = torch.clamp(fake_Ts * rcmaps + fake_Rs, 0.0, 1.0)
+        all_img = (fake_Ts * rcmaps + fake_Rs)
         all_img_mse_loss = F.mse_loss(all_img, input_image) * self.mse_loss_weight
         all_img_vgg_loss = self.compute_perceptual_loss(all_img, input_image) * self.vgg_loss_weight
         all_img_ssim_loss = (1 - self.ssim_metric(all_img, input_image)) * self.ssim_loss_weight
@@ -157,8 +160,8 @@ class CustomLoss(torch.nn.Module):
         4. 添加数值稳定性措施
         """
         # 10. 确保输入在有效范围内
-        x = torch.clamp(x, 0.0, 1.0)
-        y = torch.clamp(y, 0.0, 1.0)
+        # x = torch.clamp(x, 0.0, 1.0)
+        # y = torch.clamp(y, 0.0, 1.0)
         mean = torch.tensor([0.485, 0.456, 0.406], device=x.device).view(1, 3, 1, 1)
         std  = torch.tensor([0.229, 0.224, 0.225], device=x.device).view(1, 3, 1, 1)
         x = (x - mean) / std
@@ -194,7 +197,8 @@ class CustomLoss(torch.nn.Module):
             feat_diff = F.mse_loss(x_feat, y_feat)
             
             # 14. 对每层损失进行裁剪，避免极端值
-            feat_loss = torch.clamp(feat_diff, 0.0, 10.0)
+            # feat_loss = torch.clamp(feat_diff, 0.0, 10.0)
+            feat_loss = (feat_diff)
             loss = loss + weights[idx] * feat_loss
             
         # 15. 归一化损失，使其不会因为层数增加而过大

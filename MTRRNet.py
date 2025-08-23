@@ -536,15 +536,20 @@ class MambaSwinBlock(nn.Module):
                 )
 
         # 新增：两分支的可学习缩放
-        self.gamma_mam = nn.Parameter(torch.tensor(2.0))
-        self.gamma_swin = nn.Parameter(torch.tensor(1.0))
+        self.raw_gamma_mam = nn.Parameter(torch.zeros(1))
+        self.raw_gamma_swin = nn.Parameter(torch.zeros(1))
+        self.gamma_base = 1.0
+        self.gamma_scale = 0.75   # gamma ∈ [0.25, 1.75] 可根据需要缩小
+
+
         # 为了在 state.log 里更易观察，包一层 Identity 让监控钩子能记录
         self.mam_gain = nn.Identity()
         self.swin_gain = nn.Identity()       
     
         self.aaf = AAF(in_channels=out_channels, num_inputs=2)  
 
-
+    def _eff_gamma(self, raw):
+        return self.gamma_base + self.gamma_scale * torch.tanh(raw)
 
     def forward(self, x): # in (B,4,H,W)
         if x.shape[2] % (self.patch_size * self.window_size) !=0:
@@ -575,7 +580,7 @@ class MambaSwinBlock(nn.Module):
                 x_mam = self.decoder1_mam(x_mam) # (B, 3, H, W)
             if self.patch_size == 2:
                 x_mam = self.decoder0_mam(x_mam) # (B, 3, H, W)      
-            x_mam = self.mam_gain(self.gamma_mam * x_mam)           
+            x_mam = self.mam_gain(self._eff_gamma(self.raw_gamma_mam) * x_mam)           
         else:
             x_mam = torch.zeros(b,self.out_channels,h,w).to('cuda') 
             # x_mam = x_swin 
@@ -595,7 +600,7 @@ class MambaSwinBlock(nn.Module):
                 x_swin = self.decoder1_swin(x_swin) # (B, 3, H, W)
             if self.patch_size == 2:
                 x_swin = self.decoder0_swin(x_swin) # (B, 3, H, W)      
-            x_swin = self.swin_gain(self.gamma_swin * x_swin)  # 应用缩放（可监控）           
+            x_swin = self.swin_gain(self._eff_gamma(self.raw_gamma_swin) * x_swin)  # 应用缩放（可监控）           
         else:
             x_swin = torch.zeros(b,self.out_channels,h,w).to('cuda')
             # x_swin = x_mam
