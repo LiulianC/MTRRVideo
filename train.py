@@ -64,7 +64,7 @@ print("Applying improved initialization...")
 model.netG_T = apply_improved_init(model.netG_T)
 
 if opts.debug_monitor_layer_stats or opts.debug_monitor_layer_grad:
-    opts.epoch = 100
+    opts.epoch = 200
     opts.batch_size = 8
     opts.sampler_size1 = 0
     opts.sampler_size2 = 0
@@ -146,13 +146,27 @@ if __name__ == '__main__':
     os.mkdir(output_dir7)
 
     # 定义优化器
-    parameter_groups = [
-        {'params': [p for n, p in model.named_parameters() if 'proj.2.weight' in n], 'weight_decay': 0.01},  # PReLU参数
-        {'params': [p for n, p in model.named_parameters() if n.endswith('scale_raw')], 'weight_decay': 0.1},  # scale参数
-        {'params': [p for n, p in model.named_parameters() if 'alpha' in n], 'weight_decay': 0.05},  # alpha参数
-        {'params': [p for n, p in model.named_parameters() if not any(x in n for x in ['proj.2.weight', 'scale_raw', 'alpha'])], 'weight_decay': 0.0001}  # 其他参数
-    ]
-    optimizer = torch.optim.Adam(parameter_groups, lr=current_lr, betas=(0.5, 0.999), eps=1e-8, weight_decay=1e-5)
+    # parameter_groups = [
+    #     {'params': [p for n, p in model.named_parameters() if 'proj.2.weight' in n], 'weight_decay': 0.01},  # PReLU参数
+    #     {'params': [p for n, p in model.named_parameters() if n.endswith('scale_raw')], 'weight_decay': 0.1},  # scale参数
+    #     {'params': [p for n, p in model.named_parameters() if 'alpha' in n], 'weight_decay': 0.05},  # alpha参数
+    #     {'params': [p for n, p in model.named_parameters() if not any(x in n for x in ['proj.2.weight', 'scale_raw', 'alpha'])], 'weight_decay': 0.0001}  # 其他参数
+    # ]
+    # optimizer = torch.optim.Adam(parameter_groups, lr=current_lr, betas=(0.5, 0.999), eps=1e-8, weight_decay=1e-5)
+    norm_names = ['norm', 'bn', 'running_mean', 'running_var']
+    decay, no_decay = [], []
+    for n,p in model.netG_T.named_parameters():
+        if (p.dim()==1 and 'weight' in n) or any(x in n.lower() for x in ['raw_gamma','norm','bn']):
+            no_decay.append(p)
+        else:
+            decay.append(p)
+    optimizer = torch.optim.Adam([
+    {'params': no_decay, 'weight_decay': 0.0},
+    {'params': decay, 'weight_decay': 1e-4},
+    ], lr=current_lr, betas=(0.5,0.999), eps=1e-8)
+
+
+
     # 定义学习率调度器
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
@@ -255,6 +269,23 @@ if __name__ == '__main__':
                 for k, v in loss_table.items():
                     row[k] = v.item() if hasattr(v, "item") else float(v)
                 writer.writerow(row)
+
+
+
+            # 防止再次“深层被忽略”：增加一个轻量“深层保持能量”辅助项（低权重，不影响主优化）
+            with torch.no_grad():
+                # 统计 encoder2/3 patch_embed.proj 输出方差
+                pass
+            # 需要前向时缓存 encoder2/encoder3 的 patch_embed 输出 (在模块里加 self.debug_feat)
+            deep_feats = []
+            for m in [model.netG_T.encoder2.patch_embed, model.netG_T.encoder3.patch_embed]:
+                if hasattr(m, 'last_out'):
+                    deep_feats.append(m.last_out)
+            if deep_feats:
+                var_loss = sum([f.var(dim=[0,2,3]).mean() for f in deep_feats])  # 通道方差平均
+                target = 0.05  # 经验值，可调
+                deep_reg = F.relu(target - var_loss) * 0.1  # 只惩罚低于 target
+                all_loss = all_loss + deep_reg
 
 
 

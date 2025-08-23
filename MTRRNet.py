@@ -415,7 +415,7 @@ class ResidualSwinBlock(nn.Module):
 # Swin Transformer + Mamba Block
 # --------------------------
 class MambaSwinBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, input_resolution, img_size=(256,256), patch_size=4, window_size=7, embed_dim=96, swin_blocks=2, mamba_blocks=2):
+    def __init__(self, in_channels, out_channels, input_resolution, img_size=(256,256), patch_size=4, window_size=8, embed_dim=96, swin_blocks=2, mamba_blocks=2):
         super().__init__()
         self.input_resolution = input_resolution
         self.in_channels = in_channels
@@ -495,6 +495,7 @@ class MambaSwinBlock(nn.Module):
                     nn.ReLU(),
                     Conv2DLayer(16, out_channels, 3, padding=1)                                # → RGB残差
                 )
+
         if mamba_blocks>0:
             if self.patch_size == 2:
                 self.decoder0_mam = nn.Sequential(
@@ -504,6 +505,8 @@ class MambaSwinBlock(nn.Module):
                     nn.ReLU(),
                     Conv2DLayer(64, out_channels, 3, padding=1)                                # → RGB残差
                 )
+            
+            #(B,embed_dim,64,64) -> (B,128,128,128) -> (B,64,256,256) -> (B,3,256,256)
             if self.patch_size == 4:
                 self.decoder1_mam = nn.Sequential(
                     nn.ConvTranspose2d(embed_dim, 128, 4, stride=2, padding=1),  # (H/4 → H/2)
@@ -563,6 +566,7 @@ class MambaSwinBlock(nn.Module):
         # x = torch.clamp(x, -10.0, 10.0)
         b,c,h,w = x.shape
         x_emb = self.patch_embed(x) # flatten False x_emb(B,C,H,W)
+        self.patch_embed_out = x_emb.detach() #监督patch embed 输出
         B,C,H,W = x_emb.shape
         x_emb = x_emb.permute(0, 2, 3, 1) # be (B,H,W,C)
 
@@ -670,22 +674,21 @@ class SubNet(nn.Module):
             data *= sign
         
     def forward(self, x, c0, c1, c2, c3):
-        self._clamp_abs(self.alpha0.data, 1e-3) 
+        self._clamp_abs(self.alpha0.data, 1e-3)
         self._clamp_abs(self.alpha1.data, 1e-3)
         self._clamp_abs(self.alpha2.data, 1e-3)
         self._clamp_abs(self.alpha3.data, 1e-3)
-        
-        c0 = self.safe_add(self.alpha0 * c0, self.m(self.aaf0([x, c1])))
-        c1 = self.safe_add(self.alpha1 * c1, self.m(self.aaf1([c0, c2])))
+
+        # 先最深：用 (c1, c3) 更新 c2
         c2 = self.safe_add(self.alpha2 * c2, self.m(self.aaf2([c1, c3])))
+        # 再中层：用 (c0, c2) 更新 c1
+        c1 = self.safe_add(self.alpha1 * c1, self.m(self.aaf1([c0, c2])))
+        # 再浅层：用 (x, c1) 更新 c0
+        c0 = self.safe_add(self.alpha0 * c0, self.m(self.aaf0([x, c1])))
+        # 最后让 c3 接收 c2
         c3 = self.safe_add(self.alpha3 * c3, self.m(c2))
 
-        c0 = self.c0_view(c0)
-        c1 = self.c1_view(c1)
-        c2 = self.c2_view(c2)
-        c3 = self.c3_view(c3)
-
-        return c0, c1, c2, c3
+        return self.c0_view(c0), self.c1_view(c1), self.c2_view(c2), self.c3_view(c3)
 
 
 # --------------------------
@@ -712,24 +715,19 @@ class Decoder2(nn.Module):
         self.norm1 = nn.BatchNorm2d(in_dims[0])
         self.norm2 = nn.BatchNorm2d(in_dims[0])
 
-        self.xc2_view = nn.Identity()
-        self.xc1_view = nn.Identity()
-        self.xc0_view = nn.Identity()
+        self.delta_head = nn.Conv2d(in_dims[0], in_dims[0], 1)
+        nn.init.zeros_(self.delta_head.weight); nn.init.zeros_(self.delta_head.bias)
+        self.delta_scale = 0.1
 
     def forward(self, x_in, c0, c1, c2, c3):
-        out0 = self.m(c3)
-        o0 = self.norm0(out0)
-
-        out1 = self.m(o0 * c2)
-        o1 = self.norm1(out1)
-
-        out2 = self.m(o1 * c1)
-        o2 = self.norm2(out2)
-
+        out0 = self.m(c3); o0 = self.norm0(out0)
+        out1 = self.m(o0 * c2); o1 = self.norm1(out1)
+        out2 = self.m(o1 * c1); o2 = self.norm2(out2)
         out3 = self.m(o2 * c0)
-
-        fused = (out0 + out1 + out2 + out3) / 4.0
-        return fused
+        fused = (out0 + out1 + out2 + out3)/4.0
+        delta = torch.tanh(self.delta_head(fused))*self.delta_scale
+        base = torch.cat([x_in, x_in*0.1], dim=1)
+        return base + delta
 
 
 
@@ -824,11 +822,6 @@ class MTRRNet(nn.Module):
         x_down8 = self.encoder3(x_down8)
         
 
-        # x_down1 = checkpoint.checkpoint(self.encoder0, x_down1)
-        # x_down2 = checkpoint.checkpoint(self.encoder1, x_down2)
-        # x_down4 = checkpoint.checkpoint(self.encoder2, x_down4)
-        # x_down8 = checkpoint.checkpoint(self.encoder3, x_down8)
-
         # 通道和分辨率转换
         c0 = self.c0_adapter(x_down1) # 全变成 c=6
         c1 = self.c1_adapter(x_down2)
@@ -837,12 +830,8 @@ class MTRRNet(nn.Module):
 
         # # 四层子网络增强
         x = torch.cat([x_in,x_in],dim=1)
-        # c0, c1, c2, c3 = self.subnet0(x, c0, c1, c2, c3)
-        # c0, c1, c2, c3 = self.subnet1(x, c0, c1, c2, c3)
-        # c0, c1, c2, c3 = self.subnet2(x, c0, c1, c2, c3)
-        # c0, c1, c2, c3 = self.subnet3(x, c0, c1, c2, c3) # 都是6通道的
 
- 
+
         c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet0, x, c0, c1, c2, c3)
         c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet1, x, c0, c1, c2, c3)
         # c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet2, x, c0, c1, c2, c3)
@@ -850,12 +839,8 @@ class MTRRNet(nn.Module):
 
 
 
-        # 解码重建残差图
-        # 修复：使用x_in初始化两个通道，避免fake_R无法学习
-        out = torch.cat([x_in, x_in * 0.1],dim=1) + self.decoder2(x, c0, c1, c2, c3)
-        # out = torch.cat([x_in,x_in],dim=1) + (c0)
-        # out = self.decoder2(rmap2, c0, c1, c2, c3)
-        # out = self.decoder1(c0, c1, c2, c3)
+        out = self.decoder2(x_in, c0, c1, c2, c3)
+
 
         return rmap, out
 
