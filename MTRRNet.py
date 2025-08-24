@@ -744,9 +744,9 @@ class Decoder2(nn.Module):
 
 
 # --------------------------
-# 主模型
+# 主模型 - Legacy Implementation (原始版本)
 # --------------------------
-class MTRRNet(nn.Module):
+class MTRRNetLegacy(nn.Module):
     def __init__(self):
         super().__init__()
 
@@ -856,7 +856,180 @@ class MTRRNet(nn.Module):
 
         return rmap, out
 
- 
+
+# --------------------------
+# 新的Token-only主模型  
+# --------------------------
+
+class MTRRNet(nn.Module):
+    """Token-only多尺度架构：
+    多尺度编码 → Token融合 → 统一解码
+    频带分工：低频→Mamba，高频→Swin
+    """
+    def __init__(self, use_legacy=False):
+        super().__init__()
+        self.use_legacy = use_legacy
+        
+        if use_legacy:
+            # 使用旧实现的组件
+            self._init_legacy()
+        else:
+            # 新Token-only实现
+            self._init_token_only()
+    
+    def _init_legacy(self):
+        """初始化Legacy版本的组件"""
+        # 复制MTRRNetLegacy的初始化代码
+        self.norm_first = nn.BatchNorm2d(3)
+        self.rdm = RDM()
+        
+        # 编码器
+        self.encoder0 = MambaSwinBlock(in_channels=3, out_channels=3, img_size=(256,256), patch_size=4, embed_dim=96, input_resolution=(64, 64), window_size=8, swin_blocks=4, mamba_blocks=10)
+        self.encoder1 = MambaSwinBlock(in_channels=3, out_channels=3, img_size=(128,128), patch_size=8, embed_dim=192, input_resolution=(16, 16), window_size=8, swin_blocks=4, mamba_blocks=10)
+        self.encoder2 = MambaSwinBlock(in_channels=3, out_channels=3, img_size=(64,64), patch_size=4, embed_dim=96, input_resolution=(16, 16), window_size=8, swin_blocks=4, mamba_blocks=10)
+        self.encoder3 = MambaSwinBlock(in_channels=3, out_channels=3, img_size=(32,32), patch_size=2, embed_dim=96, input_resolution=(16, 16), window_size=4, swin_blocks=4, mamba_blocks=10)
+        
+        # 适配器
+        self.c0_adapter = nn.Sequential(Conv2DLayer(3, 6, 1, norm=nn.BatchNorm2d), nn.GELU())
+        self.c1_adapter = nn.Sequential(Conv2DLayer(3, 6, 1, norm=nn.BatchNorm2d), nn.GELU(), nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False))
+        self.c2_adapter = nn.Sequential(Conv2DLayer(3, 6, 1, norm=nn.BatchNorm2d), nn.GELU(), nn.Upsample(scale_factor=4, mode='bilinear', align_corners=False))
+        self.c3_adapter = nn.Sequential(Conv2DLayer(3, 6, 1, norm=nn.BatchNorm2d), nn.GELU(), nn.Upsample(scale_factor=8, mode='bilinear', align_corners=False))
+        
+        # SubNet
+        self.subnet0 = SubNet(in_dims=(6, 6, 6, 6), swin_num=0, mamba_num=10)
+        self.subnet1 = SubNet(in_dims=(6, 6, 6, 6), swin_num=0, mamba_num=10)
+        
+        # 解码器
+        self.decoder2 = Decoder2(in_dims=(6, 6, 6, 6), num_layers=(2, 2, 2, 2))
+        self.down8 = nn.Identity()
+        
+    def _init_token_only(self):
+        """初始化Token-only版本的组件"""
+        # 延迟导入token模块以避免循环导入和依赖问题
+        from token_modules import (
+            MultiScaleTokenEncoder, TokenSubNet, UnifiedTokenDecoder
+        )
+        
+        # RDM保持不变，用于生成rmap
+        self.rdm = RDM()
+        
+        # 多尺度Token编码器
+        self.token_encoder = MultiScaleTokenEncoder(
+            embed_dims=[192, 192, 96, 96],    # 对应原encoder0~3的embed_dim  
+            mamba_blocks=[10, 10, 10, 10],    # Mamba处理低频
+            swin_blocks=[4, 4, 4, 4]          # Swin处理高频
+        )
+        
+        # Token SubNet：多尺度token融合
+        self.token_subnet = TokenSubNet(
+            ref_resolution=64,     # 统一到64x64分辨率网格
+            embed_dim=192,         # 融合后的token维度
+            num_blocks=3           # 融合细化的block数
+        )
+        
+        # 统一Token解码器
+        self.token_decoder = UnifiedTokenDecoder(
+            token_dim=192,         # 输入token维度
+            ref_resolution=64,     # token网格分辨率
+            base_scale_init=0.3    # base缩放因子初始值
+        )
+        
+        # 用于存储中间监督结果（可视化）
+        self.intermediates = {}
+        
+        # 监控钩子用的debug张量
+        self.debug_token_stats = {}
+        
+    def forward(self, x_in):
+        """
+        输入: x_in (B, 3, 256, 256)
+        输出: (rmap, out) 其中out为6通道(T,R)
+        """
+        if self.use_legacy:
+            return self._forward_legacy(x_in)
+        else:
+            return self._forward_token_only(x_in)
+    
+    def _forward_legacy(self, x_in):
+        """Legacy版本的前向传播"""
+        # 复制MTRRNetLegacy的forward代码
+        rmap, x_down8, x_down4, x_down2 = self.rdm(x_in)
+        x_down1 = x_in
+
+        rmapd2 = F.interpolate(rmap, scale_factor=0.5, mode='bicubic')
+        rmapd4 = F.interpolate(rmap, scale_factor=0.25, mode='bicubic')
+        rmapd8 = F.interpolate(rmap, scale_factor=0.125, mode='bicubic')
+
+        x_down8 = self.down8(x_down8)
+
+        x_down1 = self.encoder0(x_down1)
+        x_down2 = self.encoder1(x_down2)
+        x_down4 = self.encoder2(x_down4)
+        x_down8 = self.encoder3(x_down8)
+
+        c0 = self.c0_adapter(x_down1)
+        c1 = self.c1_adapter(x_down2)
+        c2 = self.c2_adapter(x_down4)
+        c3 = self.c3_adapter(x_down8)
+
+        x = torch.cat([x_in, x_in], dim=1)
+
+        c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet0, x, c0, c1, c2, c3)
+        c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet1, x, c0, c1, c2, c3)
+
+        out = self.decoder2(x_in, c0, c1, c2, c3)
+        return rmap, out
+    
+    def _forward_token_only(self, x_in):
+        """Token-only版本的前向传播"""
+        B = x_in.shape[0]
+        
+        # 1. RDM提取反光先验（保持与原架构兼容）
+        rmap, _, _, _ = self.rdm(x_in)  # rmap: (B, 3, 256, 256)
+        
+        # 2. 多尺度Token编码
+        tokens_list, aux_preds = self.token_encoder(x_in)
+        # tokens_list: [t0, t1, t2, t3] 每个(B, N_i, C_i)
+        # aux_preds: {'aux_s0': pred, ...} 中间监督预测
+        
+        # 缓存中间监督结果
+        self.intermediates.update(aux_preds)
+        
+        # 缓存token统计用于监控
+        for i, tokens in enumerate(tokens_list):
+            self.debug_token_stats[f'tokens_s{i}_mean'] = tokens.mean().detach()
+            self.debug_token_stats[f'tokens_s{i}_std'] = tokens.std().detach()
+        
+        # 3. Token SubNet融合
+        fused_tokens = self.token_subnet(tokens_list)  # (B, ref_H*ref_W, embed_dim)
+        
+        # 缓存融合后token统计
+        self.debug_token_stats['fused_tokens_mean'] = fused_tokens.mean().detach()
+        self.debug_token_stats['fused_tokens_std'] = fused_tokens.std().detach()
+        
+        # 4. 统一解码：token → 6通道(T,R)
+        out = self.token_decoder(fused_tokens, x_in)  # (B, 6, 256, 256)
+        
+        # 缓存解码输出统计
+        self.debug_token_stats['output_mean'] = out.mean().detach()
+        self.debug_token_stats['output_std'] = out.std().detach()
+        
+        return rmap, out
+
+    # Legacy methods for compatibility
+    def run_subnet0(self, *inputs): 
+        return self.subnet0(*inputs) if self.use_legacy else None
+    def run_subnet1(self, *inputs): 
+        return self.subnet1(*inputs) if self.use_legacy else None
+
+    def get_intermediates(self):
+        """获取中间监督结果用于可视化（仅Token-only模式）"""
+        return self.intermediates if not self.use_legacy else {}
+    
+    def get_debug_stats(self):
+        """获取debug统计信息（仅Token-only模式）"""
+        return self.debug_token_stats if not self.use_legacy else {}
+
 
 class MTRREngine(nn.Module):
 
@@ -920,10 +1093,14 @@ class MTRREngine(nn.Module):
 
     def forward(self):
         # self.init()
-        with torch.no_grad():
-            self.Ic = self.net_c(self.I)
+        # 暂停net_c：直接使用原始输入self.I（不破坏接口）
+        # with torch.no_grad():
+        #     self.Ic = self.net_c(self.I)
+        self.Ic = self.I  # 直接设置为原始输入
+        
+        # 使用原始输入调用token-only模型
         # self.c_map, self.out = self.netG_T(self.I) 
-        self.c_map, self.out = self.netG_T(self.Ic) 
+        self.c_map, self.out = self.netG_T(self.I)  # 改为使用self.I而非self.Ic
         self.fake_T, self.fake_R = self.out[:,0:3,:,:],self.out[:,3:6,:,:]
 
 
@@ -955,6 +1132,20 @@ class MTRREngine(nn.Module):
                     lambda m, inp, out, name=name: _hook_fn(m, inp, out, name)
                 )
                 hooks.append(hook)   
+        
+        # 额外监控token统计信息
+        self.monitor_token_stats()
+
+    def monitor_token_stats(self):
+        """监控token阶段的统计信息"""
+        if hasattr(self.netG_T, 'get_debug_stats'):
+            token_stats = self.netG_T.get_debug_stats()
+            with open('./debug/token_stats.log', 'a') as f:
+                for name, value in token_stats.items():
+                    if torch.is_tensor(value):
+                        f.write(f"Token {name:<30} | Value: {value.item():>15.6f}\n")
+                    else:
+                        f.write(f"Token {name:<30} | Value: {value:>15.6f}\n")
         
 
     def monitor_layer_grad(self):
