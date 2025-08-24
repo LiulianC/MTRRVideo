@@ -744,9 +744,9 @@ class Decoder2(nn.Module):
 
 
 # --------------------------
-# 主模型
+# 主模型 - Legacy Implementation (原始版本)
 # --------------------------
-class MTRRNet(nn.Module):
+class MTRRNetLegacy(nn.Module):
     def __init__(self):
         super().__init__()
 
@@ -856,7 +856,106 @@ class MTRRNet(nn.Module):
 
         return rmap, out
 
- 
+
+# --------------------------
+# 新的Token-only主模型  
+# --------------------------
+from token_modules import (
+    FrequencySplit, TokenPatchEmbed, MambaTokenBlock, SwinTokenBlock,
+    TokenStage, MultiScaleTokenEncoder, TokenSubNet, UnifiedTokenDecoder
+)
+
+class MTRRNet(nn.Module):
+    """Token-only多尺度架构：
+    多尺度编码 → Token融合 → 统一解码
+    频带分工：低频→Mamba，高频→Swin
+    """
+    def __init__(self, use_legacy=False):
+        super().__init__()
+        
+        if use_legacy:
+            # 向后兼容：使用旧实现
+            self.__class__ = MTRRNetLegacy
+            MTRRNetLegacy.__init__(self)
+            return
+        
+        # RDM保持不变，用于生成rmap
+        self.rdm = RDM()
+        
+        # 多尺度Token编码器
+        self.token_encoder = MultiScaleTokenEncoder(
+            embed_dims=[192, 192, 96, 96],    # 对应原encoder0~3的embed_dim  
+            mamba_blocks=[10, 10, 10, 10],    # Mamba处理低频
+            swin_blocks=[4, 4, 4, 4]          # Swin处理高频
+        )
+        
+        # Token SubNet：多尺度token融合
+        self.token_subnet = TokenSubNet(
+            ref_resolution=64,     # 统一到64x64分辨率网格
+            embed_dim=192,         # 融合后的token维度
+            num_blocks=3           # 融合细化的block数
+        )
+        
+        # 统一Token解码器
+        self.token_decoder = UnifiedTokenDecoder(
+            token_dim=192,         # 输入token维度
+            ref_resolution=64,     # token网格分辨率
+            base_scale_init=0.3    # base缩放因子初始值
+        )
+        
+        # 用于存储中间监督结果（可视化）
+        self.intermediates = {}
+        
+        # 监控钩子用的debug张量
+        self.debug_token_stats = {}
+        
+    def forward(self, x_in):
+        """
+        输入: x_in (B, 3, 256, 256)
+        输出: (rmap, out) 其中out为6通道(T,R)
+        """
+        B = x_in.shape[0]
+        
+        # 1. RDM提取反光先验（保持与原架构兼容）
+        rmap, _, _, _ = self.rdm(x_in)  # rmap: (B, 3, 256, 256)
+        
+        # 2. 多尺度Token编码
+        tokens_list, aux_preds = self.token_encoder(x_in)
+        # tokens_list: [t0, t1, t2, t3] 每个(B, N_i, C_i)
+        # aux_preds: {'aux_s0': pred, ...} 中间监督预测
+        
+        # 缓存中间监督结果
+        self.intermediates.update(aux_preds)
+        
+        # 缓存token统计用于监控
+        for i, tokens in enumerate(tokens_list):
+            self.debug_token_stats[f'tokens_s{i}_mean'] = tokens.mean().detach()
+            self.debug_token_stats[f'tokens_s{i}_std'] = tokens.std().detach()
+        
+        # 3. Token SubNet融合
+        fused_tokens = self.token_subnet(tokens_list)  # (B, ref_H*ref_W, embed_dim)
+        
+        # 缓存融合后token统计
+        self.debug_token_stats['fused_tokens_mean'] = fused_tokens.mean().detach()
+        self.debug_token_stats['fused_tokens_std'] = fused_tokens.std().detach()
+        
+        # 4. 统一解码：token → 6通道(T,R)
+        out = self.token_decoder(fused_tokens, x_in)  # (B, 6, 256, 256)
+        
+        # 缓存解码输出统计
+        self.debug_token_stats['output_mean'] = out.mean().detach()
+        self.debug_token_stats['output_std'] = out.std().detach()
+        
+        return rmap, out
+
+    def get_intermediates(self):
+        """获取中间监督结果用于可视化"""
+        return self.intermediates
+    
+    def get_debug_stats(self):
+        """获取debug统计信息"""
+        return self.debug_token_stats
+
 
 class MTRREngine(nn.Module):
 
@@ -920,10 +1019,14 @@ class MTRREngine(nn.Module):
 
     def forward(self):
         # self.init()
-        with torch.no_grad():
-            self.Ic = self.net_c(self.I)
+        # 暂停net_c：直接使用原始输入self.I（不破坏接口）
+        # with torch.no_grad():
+        #     self.Ic = self.net_c(self.I)
+        self.Ic = self.I  # 直接设置为原始输入
+        
+        # 使用原始输入调用token-only模型
         # self.c_map, self.out = self.netG_T(self.I) 
-        self.c_map, self.out = self.netG_T(self.Ic) 
+        self.c_map, self.out = self.netG_T(self.I)  # 改为使用self.I而非self.Ic
         self.fake_T, self.fake_R = self.out[:,0:3,:,:],self.out[:,3:6,:,:]
 
 
@@ -955,6 +1058,20 @@ class MTRREngine(nn.Module):
                     lambda m, inp, out, name=name: _hook_fn(m, inp, out, name)
                 )
                 hooks.append(hook)   
+        
+        # 额外监控token统计信息
+        self.monitor_token_stats()
+
+    def monitor_token_stats(self):
+        """监控token阶段的统计信息"""
+        if hasattr(self.netG_T, 'get_debug_stats'):
+            token_stats = self.netG_T.get_debug_stats()
+            with open('./debug/token_stats.log', 'a') as f:
+                for name, value in token_stats.items():
+                    if torch.is_tensor(value):
+                        f.write(f"Token {name:<30} | Value: {value.item():>15.6f}\n")
+                    else:
+                        f.write(f"Token {name:<30} | Value: {value:>15.6f}\n")
         
 
     def monitor_layer_grad(self):
