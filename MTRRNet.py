@@ -860,10 +860,6 @@ class MTRRNetLegacy(nn.Module):
 # --------------------------
 # 新的Token-only主模型  
 # --------------------------
-from token_modules import (
-    FrequencySplit, TokenPatchEmbed, MambaTokenBlock, SwinTokenBlock,
-    TokenStage, MultiScaleTokenEncoder, TokenSubNet, UnifiedTokenDecoder
-)
 
 class MTRRNet(nn.Module):
     """Token-only多尺度架构：
@@ -872,12 +868,47 @@ class MTRRNet(nn.Module):
     """
     def __init__(self, use_legacy=False):
         super().__init__()
+        self.use_legacy = use_legacy
         
         if use_legacy:
-            # 向后兼容：使用旧实现
-            self.__class__ = MTRRNetLegacy
-            MTRRNetLegacy.__init__(self)
-            return
+            # 使用旧实现的组件
+            self._init_legacy()
+        else:
+            # 新Token-only实现
+            self._init_token_only()
+    
+    def _init_legacy(self):
+        """初始化Legacy版本的组件"""
+        # 复制MTRRNetLegacy的初始化代码
+        self.norm_first = nn.BatchNorm2d(3)
+        self.rdm = RDM()
+        
+        # 编码器
+        self.encoder0 = MambaSwinBlock(in_channels=3, out_channels=3, img_size=(256,256), patch_size=4, embed_dim=96, input_resolution=(64, 64), window_size=8, swin_blocks=4, mamba_blocks=10)
+        self.encoder1 = MambaSwinBlock(in_channels=3, out_channels=3, img_size=(128,128), patch_size=8, embed_dim=192, input_resolution=(16, 16), window_size=8, swin_blocks=4, mamba_blocks=10)
+        self.encoder2 = MambaSwinBlock(in_channels=3, out_channels=3, img_size=(64,64), patch_size=4, embed_dim=96, input_resolution=(16, 16), window_size=8, swin_blocks=4, mamba_blocks=10)
+        self.encoder3 = MambaSwinBlock(in_channels=3, out_channels=3, img_size=(32,32), patch_size=2, embed_dim=96, input_resolution=(16, 16), window_size=4, swin_blocks=4, mamba_blocks=10)
+        
+        # 适配器
+        self.c0_adapter = nn.Sequential(Conv2DLayer(3, 6, 1, norm=nn.BatchNorm2d), nn.GELU())
+        self.c1_adapter = nn.Sequential(Conv2DLayer(3, 6, 1, norm=nn.BatchNorm2d), nn.GELU(), nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False))
+        self.c2_adapter = nn.Sequential(Conv2DLayer(3, 6, 1, norm=nn.BatchNorm2d), nn.GELU(), nn.Upsample(scale_factor=4, mode='bilinear', align_corners=False))
+        self.c3_adapter = nn.Sequential(Conv2DLayer(3, 6, 1, norm=nn.BatchNorm2d), nn.GELU(), nn.Upsample(scale_factor=8, mode='bilinear', align_corners=False))
+        
+        # SubNet
+        self.subnet0 = SubNet(in_dims=(6, 6, 6, 6), swin_num=0, mamba_num=10)
+        self.subnet1 = SubNet(in_dims=(6, 6, 6, 6), swin_num=0, mamba_num=10)
+        
+        # 解码器
+        self.decoder2 = Decoder2(in_dims=(6, 6, 6, 6), num_layers=(2, 2, 2, 2))
+        self.down8 = nn.Identity()
+        
+    def _init_token_only(self):
+        """初始化Token-only版本的组件"""
+        # 延迟导入token模块以避免循环导入和依赖问题
+        from token_modules import (
+            MultiScaleTokenEncoder, TokenSubNet, UnifiedTokenDecoder
+        )
         
         # RDM保持不变，用于生成rmap
         self.rdm = RDM()
@@ -914,6 +945,43 @@ class MTRRNet(nn.Module):
         输入: x_in (B, 3, 256, 256)
         输出: (rmap, out) 其中out为6通道(T,R)
         """
+        if self.use_legacy:
+            return self._forward_legacy(x_in)
+        else:
+            return self._forward_token_only(x_in)
+    
+    def _forward_legacy(self, x_in):
+        """Legacy版本的前向传播"""
+        # 复制MTRRNetLegacy的forward代码
+        rmap, x_down8, x_down4, x_down2 = self.rdm(x_in)
+        x_down1 = x_in
+
+        rmapd2 = F.interpolate(rmap, scale_factor=0.5, mode='bicubic')
+        rmapd4 = F.interpolate(rmap, scale_factor=0.25, mode='bicubic')
+        rmapd8 = F.interpolate(rmap, scale_factor=0.125, mode='bicubic')
+
+        x_down8 = self.down8(x_down8)
+
+        x_down1 = self.encoder0(x_down1)
+        x_down2 = self.encoder1(x_down2)
+        x_down4 = self.encoder2(x_down4)
+        x_down8 = self.encoder3(x_down8)
+
+        c0 = self.c0_adapter(x_down1)
+        c1 = self.c1_adapter(x_down2)
+        c2 = self.c2_adapter(x_down4)
+        c3 = self.c3_adapter(x_down8)
+
+        x = torch.cat([x_in, x_in], dim=1)
+
+        c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet0, x, c0, c1, c2, c3)
+        c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet1, x, c0, c1, c2, c3)
+
+        out = self.decoder2(x_in, c0, c1, c2, c3)
+        return rmap, out
+    
+    def _forward_token_only(self, x_in):
+        """Token-only版本的前向传播"""
         B = x_in.shape[0]
         
         # 1. RDM提取反光先验（保持与原架构兼容）
@@ -948,13 +1016,19 @@ class MTRRNet(nn.Module):
         
         return rmap, out
 
+    # Legacy methods for compatibility
+    def run_subnet0(self, *inputs): 
+        return self.subnet0(*inputs) if self.use_legacy else None
+    def run_subnet1(self, *inputs): 
+        return self.subnet1(*inputs) if self.use_legacy else None
+
     def get_intermediates(self):
-        """获取中间监督结果用于可视化"""
-        return self.intermediates
+        """获取中间监督结果用于可视化（仅Token-only模式）"""
+        return self.intermediates if not self.use_legacy else {}
     
     def get_debug_stats(self):
-        """获取debug统计信息"""
-        return self.debug_token_stats
+        """获取debug统计信息（仅Token-only模式）"""
+        return self.debug_token_stats if not self.use_legacy else {}
 
 
 class MTRREngine(nn.Module):
