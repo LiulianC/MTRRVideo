@@ -16,3 +16,5 @@ nafblock.py
 debug/
 cls/
 aaa_MAMBA/
+mamba_ssm_mock.py
+test_forward.py
