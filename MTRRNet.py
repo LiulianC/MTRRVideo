@@ -399,7 +399,6 @@ class ResidualSwinBlock(nn.Module):
         if self.window_size //2 != self.shift_size:
             print(f"Warning: Window size {self.window_size} and shift size {self.shift_size} are not compatible.")
 
-        # x_emb = torch.clamp(x_emb, -10.0, 10.0)
         res = x_emb
         for block in self.blocks:
             x_emb = block(x_emb) + res  # 改为0.5，减少信息衰减
@@ -585,6 +584,8 @@ class MambaSwinBlock(nn.Module):
             if self.patch_size == 2:
                 x_mam = self.decoder0_mam(x_mam) # (B, 3, H, W)      
             x_mam = self.mam_gain(self._eff_gamma(self.raw_gamma_mam) * x_mam)           
+            # x_mam = torch.zeros(b,self.out_channels,h,w).to('cuda') # 测试 去掉mamba 网络会如何
+            # print('eff_gamma_mam:', self._eff_gamma(self.raw_gamma_mam).item())
         else:
             x_mam = torch.zeros(b,self.out_channels,h,w).to('cuda') 
             # x_mam = x_swin 
@@ -605,6 +606,7 @@ class MambaSwinBlock(nn.Module):
             if self.patch_size == 2:
                 x_swin = self.decoder0_swin(x_swin) # (B, 3, H, W)      
             x_swin = self.swin_gain(self._eff_gamma(self.raw_gamma_swin) * x_swin)  # 应用缩放（可监控）           
+            # x_swin = torch.zeros(b,self.out_channels,h,w).to('cuda') # 测试去掉swin 会如何
         else:
             x_swin = torch.zeros(b,self.out_channels,h,w).to('cuda')
             # x_swin = x_mam
@@ -687,6 +689,16 @@ class SubNet(nn.Module):
         c0 = self.safe_add(self.alpha0 * c0, self.m(self.aaf0([x, c1])))
         # 最后让 c3 接收 c2
         c3 = self.safe_add(self.alpha3 * c3, self.m(c2))
+
+
+        # # 先最深：用 (c1, c3) 更新 c2
+        # c2 = self.safe_add(self.alpha2 * c2, (self.aaf2([c1, c3])))
+        # # 再中层：用 (c0, c2) 更新 c1
+        # c1 = self.safe_add(self.alpha1 * c1, (self.aaf1([c0, c2])))
+        # # 再浅层：用 (x, c1) 更新 c0
+        # c0 = self.safe_add(self.alpha0 * c0, (self.aaf0([x, c1])))
+        # # 最后让 c3 接收 c2
+        # c3 = self.safe_add(self.alpha3 * c3, (c2))
 
         return self.c0_view(c0), self.c1_view(c1), self.c2_view(c2), self.c3_view(c3)
 
@@ -910,6 +922,7 @@ class MTRREngine(nn.Module):
         # self.init()
         with torch.no_grad():
             self.Ic = self.net_c(self.I)
+        # self.c_map, self.out = self.netG_T(self.I) 
         self.c_map, self.out = self.netG_T(self.Ic) 
         self.fake_T, self.fake_R = self.out[:,0:3,:,:],self.out[:,3:6,:,:]
 

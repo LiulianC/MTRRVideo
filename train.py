@@ -50,8 +50,8 @@ opts.sampler_size2 = 0
 opts.sampler_size3 = 800
 opts.test_size = [200,0,0]
 opts.epoch = 40
-opts.model_path='./model_fit/model_latest.pth'  
-opts.model_path=None  #如果要load就注释我
+opts.model_path='./model_fit/model_91.pth'  
+# opts.model_path=None  #如果要load就注释我
 current_lr = 1e-4 # 不可大于1e-5 否则会引起深层网络的梯度爆炸
 
 # nohup /home/gzm/cp310pt26/bin/python /home/gzm/gzm-MTRRVideo/train.py > /home/gzm/gzm-MTRRVideo/train.log 2>&1 &
@@ -466,10 +466,10 @@ if __name__ == '__main__':
 
         if avg_test_loss<min_loss:
             min_loss = avg_test_loss 
-            print(f"New best model at epoch {opts.epoch} with loss {min_loss:.4f}")
+            print(f"New best model at epoch {i} with loss {min_loss:.4f}")
             torch.save(state, "./model_fit/model_{}.pth".format(i + 1))        
         else:
-            print(f"Epoch {opts.epoch} did not improve. Best loss:{min_loss:.4f}  now: {avg_test_loss:.4f}")   
+            print(f"Epoch {i} did not improve. Best loss:{min_loss:.4f}  now: {avg_test_loss:.4f}")   
 
         t2 = time.time()
         run_times.append(t2 - t1)
