@@ -51,7 +51,7 @@ opts.sampler_size3 = 800
 opts.test_size = [200,0,0]
 opts.epoch = 40
 opts.model_path='./model_fit/model_latest.pth'  
-opts.model_path=None  #如果要load就注释我
+# opts.model_path=None  #如果要load就注释我
 current_lr = 1e-4 # 不可大于1e-5 否则会引起深层网络的梯度爆炸
 
 # nohup /home/gzm/cp310pt26/bin/python /home/gzm/gzm-MTRRVideo/train.py > /home/gzm/gzm-MTRRVideo/train.log 2>&1 &
@@ -64,7 +64,7 @@ print("Applying improved initialization...")
 model.netG_T = apply_improved_init(model.netG_T)
 
 if opts.debug_monitor_layer_stats or opts.debug_monitor_layer_grad:
-    opts.epoch = 200
+    opts.epoch = 300
     opts.batch_size = 8
     opts.sampler_size1 = 0
     opts.sampler_size2 = 0

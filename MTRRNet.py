@@ -563,9 +563,9 @@ class MTRREngine(nn.Module):
             with open('./debug/token_stats.log', 'a') as f:
                 for name, value in token_stats.items():
                     if torch.is_tensor(value):
-                        f.write(f"Token {name:<30} | Value: {value.item():>15.6f}\n")
+                        f.write(f"Token {name:<100} | Value: {value.item():>15.6f}\n")
                     else:
-                        f.write(f"Token {name:<30} | Value: {value:>15.6f}\n")
+                        f.write(f"Token {name:<100} | Value: {value:>15.6f}\n")
         
 
     def monitor_layer_grad(self):
@@ -577,7 +577,7 @@ class MTRREngine(nn.Module):
                     if is_nan or self.opts.always_print:
                         if param.grad is not None:
                             msg = (
-                                f"Param: {name:<50} | "
+                                f"Param: {name:<100} | "
                                 f"Grad Mean: {param.grad.mean().item():.15f} | "
                                 f"Grad Std: {param.grad.std().item():.15f}"
                             )
