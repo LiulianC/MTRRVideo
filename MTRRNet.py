@@ -70,305 +70,10 @@ class AAF(nn.Module):
             out += features[i] * weight            # 广播乘法
         return out
 
-# 多尺度拉普拉斯特征提取
-class LaplacianPyramid(nn.Module):
-    # filter laplacian LOG kernel, kernel size: 3.
-    # The laplacian Pyramid is used to generate high frequency images.
 
-    def __init__(self, device='cuda', dim=3):
-        super(LaplacianPyramid, self).__init__()
 
-        # 2D laplacian kernel (2D LOG operator).
-        self.channel_dim = dim
-        laplacian_kernel = np.array([[0, -1, 0],[-1, 4, -1],[0, -1, 0]])
+# ================== 0. 通用 Token Swin Transformer 堆叠 ==================
 
-        laplacian_kernel = np.repeat(laplacian_kernel[None, None, :, :], dim, 0) # 变成 (dim, 1, H, W) 
-        # learnable laplacian kernel
-
-
-        # 让 kernel 可学习但只允许在微小范围内变动
-        self.kernel = torch.nn.Parameter(torch.FloatTensor(laplacian_kernel))
-        self.register_buffer('kernel_init', torch.FloatTensor(laplacian_kernel).clone())
-
-        # 限制 kernel 在初始值±epsilon范围内
-        epsilon = 0.05
-        with torch.no_grad():
-            self.kernel.data.clamp_(self.kernel_init - epsilon, self.kernel_init + epsilon)
-
-        self.aaf = AAF(3,4)
-
-        # self.conv0 = Conv2DLayer(in_channels=dim, out_channels=dim, kernel_size=3, padding=1, bias=False, norm=nn.BatchNorm2d, act=nn.GELU())
-        # self.conv1 = Conv2DLayer(in_channels=dim, out_channels=dim, kernel_size=3, padding=1, bias=False, norm=nn.BatchNorm2d, act=nn.GELU())
-        # self.conv2 = Conv2DLayer(in_channels=dim, out_channels=dim, kernel_size=3, padding=1, bias=False, norm=nn.BatchNorm2d, act=nn.GELU())
-        # self.conv3 = Conv2DLayer(in_channels=dim, out_channels=dim, kernel_size=3, padding=1, bias=False, norm=nn.BatchNorm2d, act=nn.GELU())
-
-    def forward(self, x):
-        # print(self.kernel[0,0,:,:])
-        # pyramid module for 4 scales.
-        x0 = F.interpolate(x, scale_factor=0.125, mode='bicubic')# 下采样到 1/8
-        x1 = F.interpolate(x, scale_factor=0.25, mode='bicubic')
-        x2 = F.interpolate(x, scale_factor=0.5, mode='bicubic')
-        # groups=self.channel_dim：表示使用分组卷积，分组数为 self.channel_dim。当 groups 等于输入通道数时，相当于对每个通道进行独立卷积。
-        lap_0 = F.conv2d(x0, self.kernel, groups=self.channel_dim, padding=1, stride=1, dilation=1)
-        lap_1 = F.conv2d(x1, self.kernel, groups=self.channel_dim, padding=1, stride=1, dilation=1)
-        lap_2 = F.conv2d(x2, self.kernel, groups=self.channel_dim, padding=1, stride=1, dilation=1)
-        lap_3 = F.conv2d(x, self.kernel, groups=self.channel_dim, padding=1, stride=1, dilation=1)
-        lap_0 = F.interpolate(lap_0, scale_factor=8, mode='bicubic')
-        lap_1 = F.interpolate(lap_1, scale_factor=4, mode='bicubic')
-        lap_2 = F.interpolate(lap_2, scale_factor=2, mode='bicubic')
-        # lap_0 =  self.conv0(lap_0)
-        # lap_1 =  self.conv1(lap_1)
-        # lap_2 =  self.conv2(lap_2)
-        # lap_3 =  self.conv3(lap_3)
-
-        lap_out = torch.cat([lap_0, lap_1, lap_2, lap_3],dim=1)
-
-        return lap_out, x0,x1,x2 
-
-
-class ChannelAttention(nn.Module):
-    # The channel attention block
-    # Original relize of CBAM module.
-    # Sigma(MLP(F_max^c) + MLP(F_avg^c)) -> output channel attention feature.
-    def __init__(self, channel, reduction=16):
-        super(ChannelAttention, self).__init__()
-
-        # self.norm = nn.BatchNorm2d(channel)
-
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.max_pool = nn.AdaptiveMaxPool2d(1)
-
-        # 更稳定的初始化 + LayerNorm 替代 BatchNorm
-        self.fc = nn.Sequential(
-            nn.Conv2d(channel, channel // reduction, 1, bias=True),
-            nn.LayerNorm([channel * reduction, 1, 1]),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(channel * reduction, channel, 1, bias=True),
-        )
-
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-
-        # x = torch.clamp(x, -10.0, 10.0)  # 限制极值
-        avg_output = self.fc(torch.tanh(self.avg_pool(x)) * 3)
-        max_output = self.fc(torch.tanh(self.max_pool(x)) * 3)
-
-        out = avg_output + max_output
-        return self.sigmoid(out)
-
-# 对特征图的每个空间位置（像素）分配一个权重（0~1），突出重要区域并抑制无关背景。
-class SpatialAttention(nn.Module):
-    # The spatial attention block.
-    # Simgoid(conv([F_max^s; F_avg^s])) -> output spatial attention feature.
-    def __init__(self, kernel_size=7):
-        super(SpatialAttention, self).__init__()
-        assert kernel_size in [3, 7], 'kernel size must be 3 or 7.'
-        padding_size = 1 if kernel_size == 3 else 3
-
-        self.conv = Conv2DLayer(in_channels=2, out_channels=1, padding=padding_size, bias=False, kernel_size=kernel_size)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        avg_out = torch.mean(x, dim=1, keepdim=True) # [B,1,H,W]
-        max_out, _ = torch.max(x, dim=1, keepdim=True) # [B,1,H,W]
-
-        pool_out = torch.cat([avg_out, max_out], dim=1) # [B,2,H,W]
-        x = self.conv(pool_out) # 融合
-        return self.sigmoid(x) # 输出
-
-# 通道注意力+空间注意力
-class CBAMlayer(nn.Module):
-    # THe CBAM module(Channel & Spatial Attention feature) implement
-    # reference from paper: CBAM(Convolutional Block Attention Module)
-    def __init__(self, channel, reduction=1):
-        super(CBAMlayer, self).__init__()
-        self.channel_layer = ChannelAttention(channel, reduction)
-        self.spatial_layer = SpatialAttention()
-
-    def forward(self, x):
-        x = self.channel_layer(x) * x
-        x = self.spatial_layer(x) * x
-        return x
-
-# 带有通道注意力和空间注意力的残差快
-class ResidualCbamBlock(nn.Module):
-    # The ResBlock which contain CBAM attention module.
-
-    def __init__(self, channel, reduction, norm=nn.BatchNorm2d, dilation=1, bias=False, act=nn.ReLU(True)):
-        super(ResidualCbamBlock, self).__init__()
-
-        self.conv1 = Conv2DLayer(channel, channel, kernel_size=3, stride=1, padding=1, dilation=dilation, norm=norm, act=act, bias=bias)
-        self.conv2 = Conv2DLayer(channel, channel, kernel_size=3, stride=1, padding=1, dilation=dilation, norm=norm, act=None, bias=None)
-        self.cbam_layer = CBAMlayer(channel,reduction=1)
-
-    def forward(self, x):
-        res = x
-        x = self.conv1(x)
-        x = self.conv2(x)
-        x = self.cbam_layer(x)
-
-        out = x + res
-        return out
-
-class SElayer(nn.Module):
-
-    def __init__(self, channel, reduction=16):
-        super(SElayer, self).__init__()
-
-        self.avg_pool = nn.AdaptiveAvgPool2d(1) 
-        self.se = nn.Sequential(
-            nn.Linear(channel, channel // reduction),
-            nn.ReLU(inplace=True),
-            nn.Linear(channel // reduction, channel),
-        )
-
-    def forward(self, x):
-        b, c, _, _ = x.shape
-        y = self.avg_pool(x).view(b, c)
-        y = ((torch.tanh(self.se(y))+1)/2).view(b, c, 1, 1)
-        return x * y
-
-class SEResidualBlock(nn.Module):
-    # The ResBlock implements: the conv & skip connections here.
-    # Original Resnet paper: https://arxiv.org/pdf/1512.03385.pdf. 
-    # Which contains SE-layer implements.
-    def __init__(self, channel, norm=nn.BatchNorm2d, dilation=1, bias=False, se_reduction=None, res_scale=0.1, act=nn.GELU()):# 调用时既没有归一化 也没有激活
-        super(SEResidualBlock, self).__init__()
-
-        self.conv1 = Conv2DLayer(channel, channel, kernel_size=3, stride=1, padding=1, dilation=dilation, norm=norm, act=act, bias=bias)
-        self.conv2 = Conv2DLayer(channel, channel, kernel_size=3, stride=1, padding=1, dilation=dilation, norm=norm, act=None, bias=None)
-        self.se_layer = None
-        self.res_scale = res_scale # res_scale 是一个缩放因子，用于对残差块的输出进行缩放。其主要目的是在训练过程中稳定网络的梯度，从而加速收敛并提高训练的稳定性。
-        if se_reduction is not None: # se_reduction 通常与 Squeeze-and-Excitation (SE) 模块有关。SE 模块是一种在卷积神经网络（CNN）中的注意力机制，它通过自适应地重新校准通道特征来提升模型的表现。se_reduction 是 SE 模块中的一个参数，用于控制特征图在 Squeeze 阶段的通道缩减比例。
-            self.se_layer = SElayer(channel, se_reduction)
-
-    def forward(self, x):
-        res = x # 残差
-        x = self.conv1(x)
-        x = self.conv2(x)
-        if self.se_layer:
-            x = self.se_layer(x) # 通道注意力
-        x = x * self.res_scale 
-        out = x + res # 残差链接
-        return out
-
-# --------------------------
-# 编码块 CSA 
-# --------------------------
-class EncoderBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, reduction):
-        super().__init__()
-
-        self.conv = Conv2DLayer(in_channels, out_channels, kernel_size=3, stride=2, padding=1)
-        self.csa0 = ResidualCbamBlock(channel=out_channels, reduction=reduction)
-        self.csa1 = ResidualCbamBlock(channel=out_channels, reduction=reduction)
-        self.out = nn.Sequential(
-            Conv2DLayer(out_channels, out_channels, 1),
-            nn.BatchNorm2d(out_channels),  # 添加 BatchNorm2d
-            nn.GELU()                    
-        )
-
-    def forward(self, x):
-
-        x = self.conv(x)
-        x = self.csa0(x)
-        x = self.csa1(x)
-        return self.out(x)
-
-# --------------------------
-# 解码块
-# --------------------------
-class DecoderBlock(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.up = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=4, stride=2, padding=1)
-        self.conv = nn.Sequential(
-            Conv2DLayer(out_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),  # 添加 BatchNorm2d
-            nn.GELU()                    
-        )
-
-    def forward(self, x, skip=None):
-        x = self.up(x)
-        return self.conv(x)
-
-# --------------------------
-# RDM 模块：完整结构版
-# --------------------------
-class RDM(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-        self.Lap = LaplacianPyramid(dim=3)
-
-        self.se0 = SEResidualBlock(channel=6, se_reduction=2, res_scale=0.1)
-        self.se1 = SEResidualBlock(channel=6, se_reduction=2, res_scale=0.1)
-        self.se2 = SEResidualBlock(channel=6, se_reduction=2, res_scale=0.1)
-        self.se3 = SEResidualBlock(channel=6, se_reduction=2, res_scale=0.1)
-
-        self.se4 = SEResidualBlock(channel=18, se_reduction=6, res_scale=0.1)
-        self.se5 = SEResidualBlock(channel=18, se_reduction=6, res_scale=0.1)
-        self.se6 = SEResidualBlock(channel=18, se_reduction=6, res_scale=0.1)
-        self.se7 = SEResidualBlock(channel=18, se_reduction=6, res_scale=0.1)
-
-        # Output
-        self.out_head = Conv2DLayer(in_channels=18,out_channels=3,kernel_size=1,padding=0,stride=1,bias=False)          
-        
-        self.tanh = nn.Tanh()
-        
-        
-
-    def forward(self, x):
-
-        lap,xd8,xd4,xd2 = self.Lap(x) # B 12 H W 和 B,3,H,W
-
-        x_se = torch.cat([x, x],dim=1) # B 6 256 256 扩展是因为se要压
-        x_se = self.se0(x_se)
-        x_se = self.se1(x_se)
-        x_se = self.se2(x_se)
-        x_se = self.se3(x_se)
-
-        x_se = torch.cat([x_se, lap], dim=1) # B 6+12 256 256
-        x_se = self.se4(x_se)
-        x_se = self.se5(x_se)
-        x_se = self.se6(x_se)
-        x_se = self.se7(x_se)
-
-        out = self.out_head(x_se) # (B,3,256,256)
-        out = (self.tanh(out)+1)/2
-        return out,xd8,xd4,xd2
-
-
-
-
-
-
-class MambaBlock2D(nn.Module):
-    def __init__(self, dim, num_blocks=1):
-        super().__init__()
-        
-        # 创建多个Mamba块
-        self.blocks = nn.ModuleList()
-        for _ in range(num_blocks):
-            self.blocks.append(nn.Sequential(
-                nn.LayerNorm(dim),  # 恢复LayerNorm，稳定训练
-                Mamba(dim)
-            ))
-
-    def forward(self, x_emb):# x_emb (B,L,C) 
-
-        # with torch.amp.autocast('cuda',enabled=True):
-        # x_emb = torch.clamp(x_emb, -10.0, 10.0)
-        for block in self.blocks:
-            res = x_emb
-            x_emb = block(x_emb) + res  # 改为0.5，减少信息衰减
-
-        return x_emb # (B,L,C)
-
-# --------------------------
-# Swin Transformer
-# --------------------------
 class ResidualSwinBlock(nn.Module):
     def __init__(self, dim, input_resolution, num_heads, window_size, shift_size, mlp_ratio, swin_blocks):
         super().__init__()
@@ -399,463 +104,275 @@ class ResidualSwinBlock(nn.Module):
         if self.window_size //2 != self.shift_size:
             print(f"Warning: Window size {self.window_size} and shift size {self.shift_size} are not compatible.")
 
-        res = x_emb
         for block in self.blocks:
-            x_emb = block(x_emb) + res  # 改为0.5，减少信息衰减
-
-
+            res = x_emb
+            x_emb = block(x_emb) + res  
         return x_emb # token (B, H/4, W/4, embedim)
 
 
 
 
-
-# --------------------------
-# Swin Transformer + Mamba Block
-# --------------------------
-class MambaSwinBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, input_resolution, img_size=(256,256), patch_size=4, window_size=8, embed_dim=96, swin_blocks=2, mamba_blocks=2):
+# ================== 1. 通用 Token Mamba 堆叠 ==================
+class TokenMambaStack(nn.Module):
+    def __init__(self, dim, depth):
         super().__init__()
-        self.input_resolution = input_resolution
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.patch_size = patch_size
+        self.blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.LayerNorm(dim),
+                Mamba(dim)
+            ) for _ in range(depth)
+        ])
+    def forward(self, x):  # x: (B,L,dim)
+        for blk in self.blocks:
+            residual = x
+            x = blk(x) + residual
+        return x
+
+# ================== 2. 单分支编码（PatchEmbed + 并联 Mamba/Swin + AAF） ==================
+class SingleScaleEncoderBranch(nn.Module):
+    """
+    patch_size / embed_dim / swin_blocks / mamba_blocks 可调
+    输出 tokens: (B, L=H*W, embed_dim)
+    """
+    def __init__(self, in_ch, patch_size, embed_dim,
+                 img_size=256, input_resolution=None,
+                 swin_blocks=4, mamba_blocks=10,
+                 window_size=8):
+        super().__init__()
+        assert input_resolution is not None, "input_resolution 必须提供 (H,W)"
         self.embed_dim = embed_dim
-        self.window_size = window_size
-        self.img_size = img_size
-        self.swin_blocks = swin_blocks
-        self.mamba_blocks = mamba_blocks
-
-        self.norm_act = nn.Sequential(
-            nn.GroupNorm(1,in_channels),  
-            nn.GELU()             # 添加 PReLU 激活
-        )
-
-        self.patch_embed = PatchEmbed(
-            img_size=self.img_size,       # 输入图像大小（支持 tuple）
-            patch_size=self.patch_size,       # patch 大小（4×4）
-            in_chans=self.in_channels,         # 输入通道数（RGB）
-            embed_dim=self.embed_dim,        # 输出 token 维度
+        self.grid_h, self.grid_w = input_resolution
+        # 使用 timm 的 PatchEmbed
+        self.patch = PatchEmbed(
+            img_size=img_size,
+            patch_size=patch_size,
+            in_chans=in_ch,
+            embed_dim=embed_dim,
             flatten=False,
             norm_layer=LayerNorm2d
-        )        
+        )
+        # 并联子结构
+        self.use_mamba = mamba_blocks > 0
+        self.use_swin  = swin_blocks  > 0
+        if self.use_mamba:
+            self.mamba_stack = TokenMambaStack(embed_dim, mamba_blocks)
+        if self.use_swin:
+            self.swin_stack = ResidualSwinBlock(
+                dim=embed_dim,
+                input_resolution=input_resolution,
+                num_heads=max(1, embed_dim // 32),
+                window_size=window_size,
+                shift_size=window_size // 2,
+                mlp_ratio=4.0,
+                swin_blocks=swin_blocks
+            )
+        self.aaf = AAF(in_channels=embed_dim, num_inputs=2) if (self.use_mamba and self.use_swin) else None
 
-        if self.mamba_blocks > 0:
-            self.mamba = MambaBlock2D(dim=self.embed_dim,num_blocks=self.mamba_blocks)     
+    def forward(self, x):  # x: (B,3,256,256)
+        feat = self.patch(x)            # (B, embed_dim, H, W)
+        B,C,H,W = feat.shape
+        tokens = feat.permute(0,2,3,1).reshape(B, H*W, C)  # (B,L,C)
 
-        if self.swin_blocks>0:
-            self.swin = ResidualSwinBlock(
-                    dim=self.embed_dim,
-                    input_resolution=self.input_resolution,
-                    num_heads=self.embed_dim // 32,
-                    window_size=self.window_size,
-                    shift_size=self.window_size//2,
-                    mlp_ratio=4.0,
-                    swin_blocks = swin_blocks
-                ) 
-            
-
-        if swin_blocks>0:
-            if self.patch_size == 2:
-                self.decoder0_swin = nn.Sequential(
-                    nn.ConvTranspose2d(embed_dim, 128, 4, stride=2, padding=1),  # (H/2 → H)
-                    nn.ReLU(),
-                    Conv2DLayer(128, 64, 3, stride=1, padding=1),          # (2C → C)
-                    nn.ReLU(),
-                    Conv2DLayer(64, out_channels, 3, padding=1)                                # → RGB残差
-                )
-            if self.patch_size == 4:
-                self.decoder1_swin = nn.Sequential(
-                    nn.ConvTranspose2d(embed_dim, 128, 4, stride=2, padding=1),  # (H/4 → H/2)
-                    nn.ReLU(),
-                    nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),          # (H/2 → H)
-                    nn.ReLU(),
-                    Conv2DLayer(64, out_channels, 3, padding=1)                                # → RGB残差
-                )
-            if self.patch_size == 8:
-                self.decoder2_swin = nn.Sequential(
-                    nn.ConvTranspose2d(embed_dim, 128, 4, stride=2, padding=1),  # (H/8 → H/4)
-                    nn.ReLU(),
-                    nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),          # (H/4 → H/2)
-                    nn.ReLU(),
-                    nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1),          # (H/2 → H)
-                    nn.ReLU(),
-                    Conv2DLayer(32, out_channels, 3, padding=1)                                # → RGB残差
-                )
-            if self.patch_size == 16:
-                self.decoder3_swin = nn.Sequential(
-                    nn.ConvTranspose2d(embed_dim, 128, 4, stride=2, padding=1),  # (H/16 → H/8)
-                    nn.ReLU(),
-                    nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),          # (H/8 → H/4)
-                    nn.ReLU(),
-                    nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1),          # (H/4 → H/2)
-                    nn.ReLU(),
-                    nn.ConvTranspose2d(32, 16, 4, stride=2, padding=1),          # (H/2 → H)
-                    nn.ReLU(),
-                    Conv2DLayer(16, out_channels, 3, padding=1)                                # → RGB残差
-                )
-
-        if mamba_blocks>0:
-            if self.patch_size == 2:
-                self.decoder0_mam = nn.Sequential(
-                    nn.ConvTranspose2d(embed_dim, 128, 4, stride=2, padding=1),  # (H/2 → H)
-                    nn.ReLU(),
-                    Conv2DLayer(128, 64, 3, stride=1, padding=1),          # (2C → C)
-                    nn.ReLU(),
-                    Conv2DLayer(64, out_channels, 3, padding=1)                                # → RGB残差
-                )
-            
-            #(B,embed_dim,64,64) -> (B,128,128,128) -> (B,64,256,256) -> (B,3,256,256)
-            if self.patch_size == 4:
-                self.decoder1_mam = nn.Sequential(
-                    nn.ConvTranspose2d(embed_dim, 128, 4, stride=2, padding=1),  # (H/4 → H/2)
-                    nn.ReLU(),
-                    nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),          # (H/2 → H)
-                    nn.ReLU(),
-                    Conv2DLayer(64, out_channels, 3, padding=1)                                # → RGB残差
-                )
-            if self.patch_size == 8:
-                self.decoder2_mam = nn.Sequential(
-                    nn.ConvTranspose2d(embed_dim, 128, 4, stride=2, padding=1),  # (H/8 → H/4)
-                    nn.ReLU(),
-                    nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),          # (H/4 → H/2)
-                    nn.ReLU(),
-                    nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1),          # (H/2 → H)
-                    nn.ReLU(),
-                    Conv2DLayer(32, out_channels, 3, padding=1)                                # → RGB残差
-                )
-            if self.patch_size == 16:
-                self.decoder3_mam = nn.Sequential(
-                    nn.ConvTranspose2d(embed_dim, 128, 4, stride=2, padding=1),  # (H/16 → H/8)
-                    nn.ReLU(),
-                    nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),          # (H/8 → H/4)
-                    nn.ReLU(),
-                    nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1),          # (H/4 → H/2)
-                    nn.ReLU(),
-                    nn.ConvTranspose2d(32, 16, 4, stride=2, padding=1),          # (H/2 → H)
-                    nn.ReLU(),
-                    Conv2DLayer(16, out_channels, 3, padding=1)                                # → RGB残差
-                )
-
-        # 新增：两分支的可学习缩放
-        self.raw_gamma_mam = nn.Parameter(torch.zeros(1))
-        self.raw_gamma_swin = nn.Parameter(torch.zeros(1))
-        self.gamma_base = 1.0
-        self.gamma_scale = 0.75   # gamma ∈ [0.25, 1.75] 可根据需要缩小
-
-
-        # 为了在 state.log 里更易观察，包一层 Identity 让监控钩子能记录
-        self.mam_gain = nn.Identity()
-        self.swin_gain = nn.Identity()       
-    
-        self.aaf = AAF(in_channels=out_channels, num_inputs=2)  
-
-    def _eff_gamma(self, raw):
-        return self.gamma_base + self.gamma_scale * torch.tanh(raw)
-
-    def forward(self, x): # in (B,4,H,W)
-        if x.shape[2] % (self.patch_size * self.window_size) !=0:
-            print(f"Warning: Input height {x.shape[2]} is not divisible by patch size {self.patch_size} and window size {self.window_size}. Padding may be needed.")
-        
-        if self.img_size[0] != self.patch_size * self.input_resolution[0]:
-            print('Warning: wrong size! input_resolution should be imgsize/patchsize')
-
-
-        # x = self.norm_act(x)
-        # x = torch.clamp(x, -10.0, 10.0)
-        b,c,h,w = x.shape
-        x_emb = self.patch_embed(x) # flatten False x_emb(B,C,H,W)
-        self.patch_embed_out = x_emb.detach() #监督patch embed 输出
-        B,C,H,W = x_emb.shape
-        x_emb = x_emb.permute(0, 2, 3, 1) # be (B,H,W,C)
-
-        # mamba need (B,L,C)
-        if self.mamba_blocks>0:
-            x_mam = x_emb.reshape(B, H*W, C)
-            x_mam = self.mamba(x_mam)                               
-            x_mam = x_mam.permute(0,2,1).reshape(B,C,H,W)
-
-            if self.patch_size == 16:
-                x_mam = self.decoder3_mam(x_mam) # (B, 3, H, W)
-            if self.patch_size == 8:
-                x_mam = self.decoder2_mam(x_mam) # (B, 3, H, W)
-            if self.patch_size == 4:
-                x_mam = self.decoder1_mam(x_mam) # (B, 3, H, W)
-            if self.patch_size == 2:
-                x_mam = self.decoder0_mam(x_mam) # (B, 3, H, W)      
-            x_mam = self.mam_gain(self._eff_gamma(self.raw_gamma_mam) * x_mam)           
-            # x_mam = torch.zeros(b,self.out_channels,h,w).to('cuda') # 测试 去掉mamba 网络会如何
-            # print('eff_gamma_mam:', self._eff_gamma(self.raw_gamma_mam).item())
+        if self.use_mamba:
+            tm = self.mamba_stack(tokens)  # (B,L,C)
+        if self.use_swin:
+            ts = self.swin_stack(feat.permute(0,2,3,1))  # (B,H,W,C)
+            ts = ts.view(B, H*W, C)
+        if self.aaf is None:
+            fused = tm if self.use_mamba else ts
         else:
-            x_mam = torch.zeros(b,self.out_channels,h,w).to('cuda') 
-            # x_mam = x_swin 
+            fm = tm.view(B,H,W,C).permute(0,3,1,2)   # (B,C,H,W)
+            fs = ts.view(B,H,W,C).permute(0,3,1,2)
+            fout = self.aaf([fm, fs])               # (B,C,H,W)
+            fused = fout.flatten(2).transpose(1,2)  # (B,L,C)
+        return fused  # (B,L,C)
 
-        # swin need (B,H,W,C)
-        if self.swin_blocks>0:
-
-            x_swin = self.swin(x_emb)  # (B, H/4, W/4, embedim)
-
-            x_swin = x_swin.permute(0, 3, 1, 2)
-
-            if self.patch_size == 16:
-                x_swin = self.decoder3_swin(x_swin) # (B, 3, H, W)
-            if self.patch_size == 8:
-                x_swin = self.decoder2_swin(x_swin) # (B, 3, H, W)
-            if self.patch_size == 4:
-                x_swin = self.decoder1_swin(x_swin) # (B, 3, H, W)
-            if self.patch_size == 2:
-                x_swin = self.decoder0_swin(x_swin) # (B, 3, H, W)      
-            x_swin = self.swin_gain(self._eff_gamma(self.raw_gamma_swin) * x_swin)  # 应用缩放（可监控）           
-            # x_swin = torch.zeros(b,self.out_channels,h,w).to('cuda') # 测试去掉swin 会如何
-        else:
-            x_swin = torch.zeros(b,self.out_channels,h,w).to('cuda')
-            # x_swin = x_mam
-
-        # print(b,c,h,w)
-        # print("x_mam shape:",x_mam.shape)
-        # print("x_swin shape:",x_swin.shape)
-        if self.mamba_blocks==0 and self.swin_blocks==0:
-            return torch.zeros(b,self.out_channels,h,w).to('cuda')
-        
-        if self.mamba_blocks==0 and self.swin_blocks>0:
-            return x_swin
-        
-        if self.mamba_blocks>0 and self.swin_blocks==0:
-            return x_mam
-        
-        if self.mamba_blocks>0 and self.swin_blocks>0:
-            return self.aaf([x_mam, x_swin])  # 因为块内已经残差连接 不需要总的残差连接了
-
-    
-
-# --------------------------
-# SubNet 多尺度融合模块
-# --------------------------
-class SubNet(nn.Module):
-    def __init__(self, in_dims=(6, 6, 6, 6), swin_num=0, mamba_num=10):
+# ================== 3. 多尺度编码器（3 分支） ==================
+class MultiBranchEncoder(nn.Module):
+    def __init__(self):
         super().__init__()
+        # c0: 64x64, embed 96
+        self.branch_c0 = SingleScaleEncoderBranch(
+            in_ch=3, patch_size=4, embed_dim=96,
+            img_size=256, input_resolution=(64,64),
+            swin_blocks=4, mamba_blocks=10, window_size=8
+        )
+        # c1: 32x32, embed 192
+        self.branch_c1 = SingleScaleEncoderBranch(
+            in_ch=3, patch_size=8, embed_dim=192,
+            img_size=256, input_resolution=(32,32),
+            swin_blocks=4, mamba_blocks=10, window_size=8
+        )
+        # c2: 16x16, embed 768
+        self.branch_c2 = SingleScaleEncoderBranch(
+            in_ch=3, patch_size=16, embed_dim=768,
+            img_size=256, input_resolution=(16,16),
+            swin_blocks=4, mamba_blocks=10, window_size=2
+        )
 
-        self.m = MambaSwinBlock(in_channels=6, out_channels=6, img_size=(256,256), patch_size=4 , embed_dim=192 , input_resolution=(64 , 64), window_size=8, swin_blocks=swin_num, mamba_blocks=mamba_num)
+    def forward(self, x):
+        c0 = self.branch_c0(x)  # (B,4096,96)
+        c1 = self.branch_c1(x)  # (B,1024,192)
+        c2 = self.branch_c2(x)  # (B, 256,768)
+        return c0, c1, c2
 
-        # Level 0: 
-        self.aaf0 = AAF(in_channels=in_dims[0], num_inputs=2)
-
-        # Level 1: c0和c2融合
-        self.aaf1 = AAF(in_channels=in_dims[0], num_inputs=2)
-
-        # Level 2: c1和c3融合
-        self.aaf2 = AAF(in_channels=in_dims[0], num_inputs=2)
-
-
-        
-        shortcut_scale_init_value = 0.5
-        self.alpha0 = nn.Parameter(shortcut_scale_init_value * torch.ones((1, in_dims[0], 1, 1)),
-                                   requires_grad=True) if shortcut_scale_init_value > 0 else None
-        self.alpha1 = nn.Parameter(shortcut_scale_init_value * torch.ones((1, in_dims[1], 1, 1)),
-                                   requires_grad=True) if shortcut_scale_init_value > 0 else None
-        self.alpha2 = nn.Parameter(shortcut_scale_init_value * torch.ones((1, in_dims[2], 1, 1)),
-                                   requires_grad=True) if shortcut_scale_init_value > 0 else None
-        self.alpha3 = nn.Parameter(shortcut_scale_init_value * torch.ones((1, in_dims[3], 1, 1)),
-                                   requires_grad=True) if shortcut_scale_init_value > 0 else None
-
-        self.c0_view = nn.Identity()
-        self.c1_view = nn.Identity()
-        self.c2_view = nn.Identity()
-        self.c3_view = nn.Identity()
-    
-    def safe_add(self, x, y):
-        # 相同的实现
-        if x.shape != y.shape:
-            y = F.interpolate(y, size=x.shape[2:], mode='bicubic', align_corners=False)
-        return x + y
-
-    def _clamp_abs(self, data, value):
-        with torch.no_grad():
-            sign = data.sign() # ​​符号保留​​
-            data.abs_().clamp_(value) # 将输入张量 data 的每个元素的绝对值限制在 [value, +∞) 范围内
-            data *= sign
-        
-    def forward(self, x, c0, c1, c2, c3):
-        self._clamp_abs(self.alpha0.data, 1e-3)
-        self._clamp_abs(self.alpha1.data, 1e-3)
-        self._clamp_abs(self.alpha2.data, 1e-3)
-        self._clamp_abs(self.alpha3.data, 1e-3)
-
-        # 先最深：用 (c1, c3) 更新 c2
-        c2 = self.safe_add(self.alpha2 * c2, self.m(self.aaf2([c1, c3])))
-        # 再中层：用 (c0, c2) 更新 c1
-        c1 = self.safe_add(self.alpha1 * c1, self.m(self.aaf1([c0, c2])))
-        # 再浅层：用 (x, c1) 更新 c0
-        c0 = self.safe_add(self.alpha0 * c0, self.m(self.aaf0([x, c1])))
-        # 最后让 c3 接收 c2
-        c3 = self.safe_add(self.alpha3 * c3, self.m(c2))
-
-
-        # # 先最深：用 (c1, c3) 更新 c2
-        # c2 = self.safe_add(self.alpha2 * c2, (self.aaf2([c1, c3])))
-        # # 再中层：用 (c0, c2) 更新 c1
-        # c1 = self.safe_add(self.alpha1 * c1, (self.aaf1([c0, c2])))
-        # # 再浅层：用 (x, c1) 更新 c0
-        # c0 = self.safe_add(self.alpha0 * c0, (self.aaf0([x, c1])))
-        # # 最后让 c3 接收 c2
-        # c3 = self.safe_add(self.alpha3 * c3, (c2))
-
-        return self.c0_view(c0), self.c1_view(c1), self.c2_view(c2), self.c3_view(c3)
-
-
-# --------------------------
-# 解码器
-# --------------------------
-class Decoder1(nn.Module):
-    def __init__(self,in_channels, num_inputs):
+# ================== 4. 跨尺度适配工具 ==================
+class TokenAdapter(nn.Module):
+    """提供 上采样 / 下采样 + 线性投影 功能 (H,W 已知)"""
+    def __init__(self, in_dim, out_dim, in_hw, out_hw):
         super().__init__()
+        self.in_h, self.in_w = in_hw
+        self.out_h, self.out_w = out_hw
+        self.proj_in = nn.Identity()  # 可按需要调整投影顺序
+        self.proj_out = nn.Linear(in_dim, out_dim) if in_dim != out_dim else nn.Identity()
 
-        self.aaf = AAF(in_channels=in_channels,num_inputs=num_inputs)
-
-    def forward(self, c0, c1, c2, c3):
-
-        x = self.aaf([c0,c1,c2,c3])
-
+    def forward(self, tokens):
+        # tokens: (B, L_in, C_in) 其中 L_in = in_h * in_w
+        B, L, C = tokens.shape
+        x = tokens.view(B, self.in_h, self.in_w, C).permute(0,3,1,2)  # (B,C,H,W)
+        if self.in_h != self.out_h or self.in_w != self.out_w:
+            x = F.interpolate(x, size=(self.out_h, self.out_w), mode='bilinear', align_corners=False)
+        x = x.permute(0,2,3,1).reshape(B, self.out_h*self.out_w, C)
+        x = self.proj_out(x)  # (B, L_out, out_dim)
         return x
-    
-class Decoder2(nn.Module):
-    def __init__(self, in_dims=(6, 6, 6, 6), num_layers=(4, 4, 4, 4)):
+
+# ================== 5. 融合阶段（两次迭代显式写出） ==================
+class TwoIterMultiScaleFusion(nn.Module):
+    """
+    每个尺度各自有 fusion_mamba 堆叠 (dim = 该尺度 embed_dim)
+    迭代 2 次，显式展开，不用循环。
+    仅 c1_next 使用 AAF 融合来自 (c0, c2) 适配后的特征。
+    """
+    def __init__(self):
         super().__init__()
-        
-        self.m = MambaSwinBlock(in_channels=in_dims[0], out_channels=in_dims[0], img_size=(256,256), patch_size=4 , embed_dim=192 , input_resolution=(64 , 64), window_size=8, swin_blocks=0, mamba_blocks=num_layers[0])
-        self.norm0 = nn.BatchNorm2d(in_dims[0])
-        self.norm1 = nn.BatchNorm2d(in_dims[0])
-        self.norm2 = nn.BatchNorm2d(in_dims[0])
+        # 第一尺度的 token 尺寸
+        self.c0_hw = (64,64); self.c0_dim = 96
+        self.c1_hw = (32,32); self.c1_dim = 192
+        self.c2_hw = (16,16); self.c2_dim = 768
 
-        self.delta_head = nn.Conv2d(in_dims[0], in_dims[0], 1)
-        nn.init.zeros_(self.delta_head.weight); nn.init.zeros_(self.delta_head.bias)
-        self.delta_scale = 0.1
+        fusion_depth = 5
+        # 每尺度自己的融合 Mamba
+        self.mamba_c0 = TokenMambaStack(self.c0_dim, fusion_depth)
+        self.mamba_c1 = TokenMambaStack(self.c1_dim, fusion_depth)
+        self.mamba_c2 = TokenMambaStack(self.c2_dim, fusion_depth)
 
-    def forward(self, x_in, c0, c1, c2, c3):
-        out0 = self.m(c3); o0 = self.norm0(out0)
-        out1 = self.m(o0 * c2); o1 = self.norm1(out1)
-        out2 = self.m(o1 * c1); o2 = self.norm2(out2)
-        out3 = self.m(o2 * c0)
-        fused = (out0 + out1 + out2 + out3)/4.0
-        delta = torch.tanh(self.delta_head(fused))*self.delta_scale
-        base = torch.cat([x_in, x_in*0.1], dim=1)
-        return base + delta
+        self.mamba_c0_2 = TokenMambaStack(self.c0_dim, fusion_depth)
+        self.mamba_c1_2 = TokenMambaStack(self.c1_dim, fusion_depth)
+        self.mamba_c2_2 = TokenMambaStack(self.c2_dim, fusion_depth)
 
+        # 适配器（c1→c2, c0→c1, c2→c1, c1→c0） 两次迭代共用相同结构（参数共享）
+        self.adapt_c1_to_c2 = TokenAdapter(in_dim=self.c1_dim, out_dim=self.c2_dim,
+                                           in_hw=self.c1_hw, out_hw=self.c2_hw)
+        self.adapt_c0_to_c1 = TokenAdapter(in_dim=self.c0_dim, out_dim=self.c1_dim,
+                                           in_hw=self.c0_hw, out_hw=self.c1_hw)
+        self.adapt_c2_to_c1 = TokenAdapter(in_dim=self.c2_dim, out_dim=self.c1_dim,
+                                           in_hw=self.c2_hw, out_hw=self.c1_hw)
+        self.adapt_c1_to_c0 = TokenAdapter(in_dim=self.c1_dim, out_dim=self.c0_dim,
+                                           in_hw=self.c1_hw, out_hw=self.c0_hw)
 
+        # 只在 c1 融合时需要 AAF (输入通道 = c1_dim, num_inputs=2)
+        self.aaf_c1 = AAF(in_channels=self.c1_dim, num_inputs=2)
 
-# --------------------------
-# 主模型
-# --------------------------
+    def _fusion_step(self, c0, c1, c2,
+                     mamba_c0, mamba_c1, mamba_c2):
+        """
+        单步：
+          c2_next = c2 + M_c2( adapt(c1) )
+          c1_next = c1 + M_c1( AAF( adapt(c0), adapt(c2) ) )
+          c0_next = c0 + M_c0( adapt(c1) )
+        """
+        # c2 更新
+        c1_down_to_c2 = self.adapt_c1_to_c2(c1)           # (B,256,768)
+        c2_delta = mamba_c2(c1_down_to_c2)                # (B,256,768)
+        c2_next = c2 + c2_delta
+
+        # c1 更新 (AAF 融合 c0->c1 与 c2->c1)
+        c0_down_to_c1 = self.adapt_c0_to_c1(c0)           # (B,1024,192)
+        c2_up_to_c1   = self.adapt_c2_to_c1(c2)           # (B,1024,192)
+        B, L1, C1 = c0_down_to_c1.shape
+        H1, W1 = self.c1_hw
+        f0 = c0_down_to_c1.view(B,H1,W1,C1).permute(0,3,1,2)  # (B,192,32,32)
+        f2 = c2_up_to_c1.view(B,H1,W1,C1).permute(0,3,1,2)
+        fused_c1_feat = self.aaf_c1([f0, f2])             # (B,192,32,32)
+        fused_c1_tokens = fused_c1_feat.flatten(2).transpose(1,2)
+        c1_delta = mamba_c1(fused_c1_tokens)
+        c1_next = c1 + c1_delta
+
+        # c0 更新
+        c1_up_to_c0 = self.adapt_c1_to_c0(c1)             # (B,4096,96)
+        c0_delta = mamba_c0(c1_up_to_c0)
+        c0_next = c0 + c0_delta
+
+        return c0_next, c1_next, c2_next
+
+    def forward(self, c0, c1, c2):
+        # 第一次迭代
+        c0_1, c1_1, c2_1 = self._fusion_step(
+            c0, c1, c2, self.mamba_c0, self.mamba_c1, self.mamba_c2
+        )
+        # 第二次迭代（使用另一套 Mamba 堆栈）
+        c0_2, c1_2, c2_2 = self._fusion_step(
+            c0_1, c1_1, c2_1, self.mamba_c0_2, self.mamba_c1_2, self.mamba_c2_2
+        )
+        return c0_2, c1_2, c2_2
+
+# ================== 6. 统一解码器 ==================
+class UnifiedDecoderTokens(nn.Module):
+    """
+    输入：c0(4096,96), c1(1024,192), c2(256,768)
+    输出：out (B,6,256,256)
+    """
+    def __init__(self):
+        super().__init__()
+        self.c0_proj = nn.Linear(96, 192)
+        self.c2_proj = nn.Linear(768,192)
+        self.fuse_conv1x1 = nn.Conv2d(192*3, 192, 1)
+
+        # 转置卷积上采样 64->128->256
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(192,192,4,2,1),  # 64 -> 128
+            nn.GELU(),
+            nn.ConvTranspose2d(192,192,4,2,1),  # 128 -> 256
+            nn.GELU(),
+            nn.Conv2d(192,6,1)
+        )
+
+    def forward(self, c0, c1, c2, x_in):
+        B = c0.shape[0]
+        # c0: (B,4096,96) → proj
+        c0_192 = self.c0_proj(c0)  # (B,4096,192)
+        c0_map = c0_192.transpose(1,2).view(B,192,64,64)
+
+        # c1: (B,1024,192) → upsample 32→64
+        c1_map = c1.transpose(1,2).view(B,192,32,32)
+        c1_map = F.interpolate(c1_map, size=(64,64), mode='bilinear', align_corners=False)
+
+        # c2: (B,256,768) → upsample 16→64, proj
+        c2_map = c2.transpose(1,2).view(B,768,16,16)
+        c2_map = F.interpolate(c2_map, size=(64,64), mode='bilinear', align_corners=False)
+        c2_map = self.c2_proj(c2_map.flatten(2).transpose(1,2)).transpose(1,2).view(B,192,64,64)
+
+        fused = torch.cat([c0_map, c1_map, c2_map], dim=1)   # (B,576,64,64)
+        fused = self.fuse_conv1x1(fused)                     # (B,192,64,64)
+        D = self.decoder(fused)                              # (B,6,256,256)
+
+        base = 0.3 * torch.cat([x_in, x_in], dim=1)          # (B,6,256,256)
+        out = base + D
+        return out
+
+# ================== 7. 顶层整合主干（供 MTRRNet 调用） ==================
 class MTRRNet(nn.Module):
     def __init__(self):
         super().__init__()
+        self.encoder = MultiBranchEncoder()
+        self.fusion  = TwoIterMultiScaleFusion()
+        self.decoder = UnifiedDecoderTokens()
 
-        self.norm_first = nn.BatchNorm2d(3)
-
-        self.rdm = RDM()  # 提取高光区域图
-
-        # 编码器三阶段：Swin+Mamba 堆叠结构
-        # input_resolution要是window_size的倍数
-        # input H/W 推荐是 patch_size 和 window_size 的公倍数
-        # 输入256*256
-        self.encoder0 = MambaSwinBlock(in_channels=3, out_channels=3, img_size=(256,256), patch_size=4 , embed_dim=96 , input_resolution=(64 , 64), window_size=8, swin_blocks=4, mamba_blocks=10) # 最细节的
-        # 输入128*128
-        self.encoder1 = MambaSwinBlock(in_channels=3, out_channels=3, img_size=(128,128), patch_size=8 , embed_dim=192, input_resolution=(16 , 16), window_size=8, swin_blocks=4, mamba_blocks=10)
-        # 输入64*64
-        self.encoder2 = MambaSwinBlock(in_channels=3, out_channels=3, img_size=(64 , 64), patch_size=4 , embed_dim=96 , input_resolution=(16 , 16), window_size=8, swin_blocks=4, mamba_blocks=10)
-        # 输入32*32
-        self.encoder3 = MambaSwinBlock(in_channels=3, out_channels=3, img_size=(32 , 32), patch_size=2 , embed_dim=96 , input_resolution=(16 , 16), window_size=4, swin_blocks=4, mamba_blocks=10)
-
-        # 特征通道适配
-        self.c0_adapter = nn.Sequential(
-            Conv2DLayer(3, 6, 1, norm=nn.BatchNorm2d),
-            nn.GELU()
-        )
-        self.c1_adapter = nn.Sequential(
-            Conv2DLayer(3, 6, 1, norm=nn.BatchNorm2d),
-            nn.GELU(),
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)  # 上采样至 256×256
-        )
-        self.c2_adapter = nn.Sequential(
-            Conv2DLayer(3, 6, 1, norm=nn.BatchNorm2d),
-            nn.GELU(),
-            nn.Upsample(scale_factor=4, mode='bilinear', align_corners=False)  # 上采样至 256×256
-        )
-        self.c3_adapter = nn.Sequential(
-            Conv2DLayer(3, 6, 1, norm=nn.BatchNorm2d),
-            nn.GELU(),
-            nn.Upsample(scale_factor=8, mode='bilinear', align_corners=False)  # 上采样至 256×256
-        )
-
-
-        # 三层 SubNet，不共享参数
-        self.subnet0 = SubNet(in_dims=(6, 6, 6, 6), swin_num=0, mamba_num=10)
-        self.subnet1 = SubNet(in_dims=(6, 6, 6, 6), swin_num=0, mamba_num=10)
-        # self.subnet2 = SubNet(in_dims=(6, 6, 6, 6), num_layers=(2, 2, 2, 2))
-        # self.subnet3 = SubNet(in_dims=(6, 6, 6, 6), num_layers=(2, 2, 2, 2))
-
-        # 解码器
-        # self.decoder1 = Decoder1(6,4)
-        self.decoder2 = Decoder2(in_dims=(6, 6, 6, 6), num_layers=(2, 2, 2, 2))
-
-        self.down8 = nn.Identity()
- 
-
-    def run_subnet0(self, *inputs): return self.subnet0(*inputs)
-    def run_subnet1(self, *inputs): return self.subnet1(*inputs)
-    # def run_subnet2(self, *inputs): return self.subnet2(*inputs)
-    # def run_subnet3(self, *inputs): return self.subnet3(*inputs)
-
-    def forward(self, x_in):
-        # x_in = self.norm_first(x_in)
-        rmap,x_down8,x_down4,x_down2 = self.rdm(x_in)  # 提取反光区域图 都是c=3
-        x_down1 = x_in
-
-        # rmap = 1-rmap  # 反光区域图取反才是抑制反光
-
-        rmapd2 = F.interpolate(rmap, scale_factor=0.5, mode='bicubic')
-        rmapd4 = F.interpolate(rmap, scale_factor=0.25, mode='bicubic')
-        rmapd8 = F.interpolate(rmap, scale_factor=0.125, mode='bicubic')# 下采样到 1/8
-
-        # x_down1 = torch.cat([x_down1, rmap], dim=1)  # B, 4, 128, 128
-        # x_down2 = torch.cat([x_down2, rmapd2], dim=1)
-        # x_down4 = torch.cat([x_down4, rmapd4], dim=1)
-        # x_down8 = torch.cat([x_down8, rmapd8], dim=1)  # B, 4, 32, 32
-        # x_down1 = x_down1 * rmap    # B, 4, 128, 128
-        # x_down2 = x_down2 * rmapd2
-        # x_down4 = x_down4 * rmapd4
-        # x_down8 = x_down8 * rmapd8  # B, 4, 32, 32
-
-        x_down8 = self.down8(x_down8) # 观察
-
-        x_down1 = self.encoder0(x_down1)
-        x_down2 = self.encoder1(x_down2)
-        x_down4 = self.encoder2(x_down4)
-        x_down8 = self.encoder3(x_down8)
-        
-
-        # 通道和分辨率转换
-        c0 = self.c0_adapter(x_down1) # 全变成 c=6
-        c1 = self.c1_adapter(x_down2)
-        c2 = self.c2_adapter(x_down4)
-        c3 = self.c3_adapter(x_down8)
-
-        # # 四层子网络增强
-        x = torch.cat([x_in,x_in],dim=1)
-
-
-        c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet0, x, c0, c1, c2, c3)
-        c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet1, x, c0, c1, c2, c3)
-        # c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet2, x, c0, c1, c2, c3)
-        # c0, c1, c2, c3 = checkpoint.checkpoint(self.run_subnet3, x, c0, c1, c2, c3)    
-
-
-
-        out = self.decoder2(x_in, c0, c1, c2, c3)
-
-
-        return rmap, out
-
+    def forward(self, x):
+        c0, c1, c2 = self.encoder(x)
+        c0_f, c1_f, c2_f = self.fusion(c0, c1, c2)
+        out = self.decoder(c0_f, c1_f, c2_f, x)
+        return out
  
 
 class MTRREngine(nn.Module):
@@ -922,9 +439,10 @@ class MTRREngine(nn.Module):
         # self.init()
         with torch.no_grad():
             self.Ic = self.net_c(self.I)
-        # self.c_map, self.out = self.netG_T(self.I) 
-        self.c_map, self.out = self.netG_T(self.Ic) 
+        self.out = self.netG_T(self.I) 
+        self.out = self.netG_T(self.Ic) 
         self.fake_T, self.fake_R = self.out[:,0:3,:,:],self.out[:,3:6,:,:]
+        self.c_map = torch.zeros_like(self.I)
 
 
         
@@ -942,7 +460,7 @@ class MTRREngine(nn.Module):
 
                 is_nan = math.isnan(mean) or math.isnan(std)
                 if is_nan or self.opts.always_print:
-                    msg = f"{layer_name:<50} | Mean: {mean:>15.6f} | Std: {std:>15.6f} | Shape: {tuple(output.shape)}"
+                    msg = f"{layer_name:<70} | Mean: {mean:>15.6f} | Std: {std:>15.6f} | Shape: {tuple(output.shape)}"
                     # print(msg)
                     with open('./debug/state.log', 'a') as f:
                         f.write(msg + '\n')# 修正钩子函数参数（正确接收module, input, output）
@@ -966,7 +484,7 @@ class MTRREngine(nn.Module):
                     if is_nan or self.opts.always_print:
                         if param.grad is not None:
                             msg = (
-                                f"Param: {name:<50} | "
+                                f"Param: {name:<70} | "
                                 f"Grad Mean: {param.grad.mean().item():.15f} | "
                                 f"Grad Std: {param.grad.std().item():.15f}"
                             )

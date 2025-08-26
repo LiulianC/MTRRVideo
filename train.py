@@ -50,7 +50,7 @@ opts.sampler_size2 = 0
 opts.sampler_size3 = 800
 opts.test_size = [200,0,0]
 opts.epoch = 40
-opts.model_path='./model_fit/model_91.pth'  
+opts.model_path='./model_fit/model_latest.pth'  
 # opts.model_path=None  #如果要load就注释我
 current_lr = 1e-4 # 不可大于1e-5 否则会引起深层网络的梯度爆炸
 
@@ -269,24 +269,6 @@ if __name__ == '__main__':
                 for k, v in loss_table.items():
                     row[k] = v.item() if hasattr(v, "item") else float(v)
                 writer.writerow(row)
-
-
-
-            # 防止再次“深层被忽略”：增加一个轻量“深层保持能量”辅助项（低权重，不影响主优化）
-            with torch.no_grad():
-                # 统计 encoder2/3 patch_embed.proj 输出方差
-                pass
-            # 需要前向时缓存 encoder2/encoder3 的 patch_embed 输出 (在模块里加 self.debug_feat)
-            deep_feats = []
-            for m in [model.netG_T.encoder2.patch_embed, model.netG_T.encoder3.patch_embed]:
-                if hasattr(m, 'last_out'):
-                    deep_feats.append(m.last_out)
-            if deep_feats:
-                var_loss = sum([f.var(dim=[0,2,3]).mean() for f in deep_feats])  # 通道方差平均
-                target = 0.05  # 经验值，可调
-                deep_reg = F.relu(target - var_loss) * 0.1  # 只惩罚低于 target
-                all_loss = all_loss + deep_reg
-
 
 
             optimizer.zero_grad()
