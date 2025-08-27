@@ -40,7 +40,7 @@ opts.shuffle = 0
 opts.display_id = -1  
 opts.num_workers = 0
 
-opts.always_print = 1
+opts.always_print = 0
 opts.debug_monitor_layer_stats = 1 # debug模式开启时 epoch和size都要为1 要load模型 可同时打开
 opts.debug_monitor_layer_grad = 1 # # debug模式开启时 epoch和size都要为1 要load模型bash
 opts.draw_attention_map = False # 注册cbam钩子 画注意力热力图 训练数据集要改 epoch和size都要为1 要load模型 batchsize要改1
@@ -51,7 +51,7 @@ opts.test_size = [200,0,0]
 opts.epoch = 40
 opts.model_path='./model_fit/model_latest.pth'  
 opts.model_path=None  #如果要load就注释我
-current_lr = 1e-6 # 不可大于1e-5 否则会引起深层网络的梯度爆炸
+current_lr = 1e-5 # 不可大于1e-5 否则会引起深层网络的梯度爆炸
 
 # nohup /home/gzm/cp310pt26/bin/python /home/gzm/gzm-MTRRVideo/train.py > /home/gzm/gzm-MTRRVideo/train.log 2>&1 &
 
@@ -144,13 +144,6 @@ if __name__ == '__main__':
     os.mkdir(output_dir7)
 
     # 定义优化器
-    # parameter_groups = [
-    #     {'params': [p for n, p in model.named_parameters() if 'proj.2.weight' in n], 'weight_decay': 0.01},  # PReLU参数
-    #     {'params': [p for n, p in model.named_parameters() if n.endswith('scale_raw')], 'weight_decay': 0.1},  # scale参数
-    #     {'params': [p for n, p in model.named_parameters() if 'alpha' in n], 'weight_decay': 0.05},  # alpha参数
-    #     {'params': [p for n, p in model.named_parameters() if not any(x in n for x in ['proj.2.weight', 'scale_raw', 'alpha'])], 'weight_decay': 0.0001}  # 其他参数
-    # ]
-    # optimizer = torch.optim.Adam(parameter_groups, lr=current_lr, betas=(0.5, 0.999), eps=1e-8, weight_decay=1e-5)
     norm_names = ['norm', 'bn', 'running_mean', 'running_var']
     decay, no_decay = [], []
     for n,p in model.netG_T.named_parameters():
@@ -268,23 +261,8 @@ if __name__ == '__main__':
                     row[k] = v.item() if hasattr(v, "item") else float(v)
                 writer.writerow(row)
 
-
             optimizer.zero_grad()
             # scaler.scale(all_loss).backward()
-
-            torch.autograd.set_detect_anomaly(True) # 检测异常nan 打印出具体算子 很消耗性能 训练时关闭
-
-            def detect_nan_grad(module, grad_input, grad_output):
-                for gi in grad_input:
-                    if gi is not None and (torch.isnan(gi).any() or torch.isinf(gi).any()):
-                        print(f"⚠️ NaN/Inf in grad_input of {module.__class__.__name__}")
-                for go in grad_output:
-                    if go is not None and (torch.isnan(go).any() or torch.isinf(go).any()):
-                        print(f"⚠️ NaN/Inf in grad_output of {module.__class__.__name__}")
-
-            for name, module in model.named_modules():
-                module.register_full_backward_hook(detect_nan_grad)
-
             
             all_loss.backward()
 

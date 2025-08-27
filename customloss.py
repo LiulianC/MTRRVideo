@@ -25,7 +25,7 @@ class CustomLoss(torch.nn.Module):
         
         # 2. 调整损失权重，避免过大权重
         self.ssim_loss_weight = 0.5
-        self.vgg_loss_weight = 0.08  # 从0.7降低到0.5，减少VGG损失的影响
+        self.vgg_loss_weight = 0.24  # 从0.7降低到0.5，减少VGG损失的影响
         self.mse_loss_weight = 0.3
         self.color_loss_weight = 0.4
         
