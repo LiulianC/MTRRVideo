@@ -66,6 +66,20 @@ def init_all_weights(model: nn.Module):
         if param.dim() >= 2 and 'head.weight' in name.lower():
             param.data -= param.data.mean()
 
+    # 新增：特殊初始化线性层
+    for name, m in model.named_modules():
+        if isinstance(m, nn.Linear):
+            # Xavier初始化 + 缩小增益
+            nn.init.xavier_normal_(m.weight, gain=0.01)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0.01)  # 避免死神经元
+                
+    # 新增：Mamba层特殊初始化
+    for name, param in model.named_parameters():
+        if 'mamba' in name and 'weight' in name:
+            if param.dim() == 2:  # 线性层权重
+                nn.init.kaiming_normal_(param, mode='fan_in', nonlinearity='linear')
+
     with torch.no_grad():
         for p in model.parameters():
             if p.dim() >= 2 and torch.isfinite(p).all():
@@ -95,40 +109,58 @@ class Conv2DLayer(nn.Sequential):
 
 # Attention-Aware Fusion
 class AAF(nn.Module):
-    def __init__(self, in_channels, num_inputs, expansion=4, temperature=2.0, use_bn=True):
-        super(AAF, self).__init__()
+    """
+    Attention-Aware Fusion
+    关键稳定点：
+      - 降低 expansion (默认 4)
+      - 中间 BN 稳定隐藏层方差
+      - logits 中心化 + 温度缩放
+      - 最后一层 1x1 Conv 权重 0 初始化 → 起始近似均匀注意力
+      - 可选 logits 截断，避免极端数值导致 softmax 饱和 (默认关闭)
+    """
+    def __init__(self,
+                 in_channels,
+                 num_inputs,
+                 expansion=4,
+                 temperature=2.0,
+                 use_bn=True,
+                 clamp_logit=None):   # clamp_logit = (min,max) 例如 (-20,20)；默认 None 不截断
+        super().__init__()
         self.in_channels = in_channels
         self.num_inputs = num_inputs
-        self.temperature = temperature  # softmax 温度 >1 降低对极值敏感
-        hidden_channels = num_inputs * in_channels * expansion  # 原来是 *16 现在降到 *4 默认
-        layers = [
-            nn.Conv2d(num_inputs * in_channels, hidden_channels, 1, bias=False)
-        ]
+        self.temperature = temperature
+        self.clamp_logit = clamp_logit
+        hidden_channels = num_inputs * in_channels * expansion
+
+        layers = [nn.Conv2d(num_inputs * in_channels, hidden_channels, 1, bias=False)]
         if use_bn:
-            layers.append(nn.BatchNorm2d(hidden_channels))  # 归一化稳定方差
+            layers.append(nn.BatchNorm2d(hidden_channels))
         layers.append(nn.GELU())
         layers.append(nn.Conv2d(hidden_channels, num_inputs, 1, bias=False))
         self.attn = nn.Sequential(*layers)
-        # 初始化最后一层为 0，起始时近似均匀注意力
+
+        # --- MOD: 最后一层置零，防止初始极化
         nn.init.zeros_(self.attn[-1].weight)
 
     def forward(self, features):
-        # features: list[Tensors] 形状一致 [B,C,H,W]
-        x = torch.cat(features, dim=1)  # [B, num_inputs*C, H, W]
-        logits = self.attn(x)           # [B, num_inputs, H, W]
-        # 减去均值 → 中心化，防止数值过大饱和
+        # features: list of [B,C,H,W]
+        x = torch.cat(features, dim=1)                # (B, num_inputs*C, H, W)
+        logits = self.attn(x)                        # (B, num_inputs, H, W)
+        # --- MOD: 中心化降低绝对幅值
         logits = logits - logits.mean(dim=1, keepdim=True)
-        # 温度缩放
-        attn_weights = torch.softmax(logits / self.temperature, dim=1)
-        # 融合
-        out = 0
-        # 显式展开 2 输入（假设 num_inputs=2）
-        if self.num_inputs == 2:
-            out = features[0] * attn_weights[:, 0:1] + features[1] * attn_weights[:, 1:2]
+        if self.clamp_logit is not None:
+            logits = logits.clamp(*self.clamp_logit)
+        # --- MOD: 温度缩放
+        attn = torch.softmax(logits / self.temperature, dim=1)
+
+        if self.num_inputs == 2:                     # 展开提升可读性
+            out = features[0] * attn[:, 0:1] + features[1] * attn[:, 1:2]
         else:
+            out = 0
             for i in range(self.num_inputs):
-                out = out + features[i] * attn_weights[:, i:i+1]
+                out = out + features[i] * attn[:, i:i+1]
         return out
+
 
 
 
@@ -146,7 +178,7 @@ class ResidualSwinBlock(nn.Module):
         self.blocks = nn.ModuleList()
         for _ in range(swin_blocks):
             self.blocks.append(nn.Sequential(
-                nn.LayerNorm(dim),  # 恢复LayerNorm，稳定训练
+                nn.LayerNorm(dim),  # swin自带layernorm 多一个扰乱分布
                 SwinTransformerBlock(
                     dim=dim,
                     input_resolution=input_resolution,
@@ -196,6 +228,7 @@ class MambaFFBlock(nn.Module):
         )
 
     def forward(self, x):
+        
         # 残差 1：Mamba
         x = x + self.mamba(self.norm1(x))
         # 残差 2：前馈
@@ -330,76 +363,66 @@ class TokenAdapter(nn.Module):
 
 # ================== 5. 融合阶段（两次迭代显式写出） ==================
 class TwoIterMultiScaleFusion(nn.Module):
-    """
-    每个尺度各自有 fusion_mamba 堆叠 (dim = 该尺度 embed_dim)
-    迭代 2 次，显式展开，不用循环。
-    仅 c1_next 使用 AAF 融合来自 (c0, c2) 适配后的特征。
-    """
     def __init__(self):
         super().__init__()
-        # 第一尺度的 token 尺寸
         self.c0_hw = (64,64); self.c0_dim = 96
         self.c1_hw = (32,32); self.c1_dim = 192
         self.c2_hw = (16,16); self.c2_dim = 768
 
         fusion_depth = 5
-        # 每尺度自己的融合 Mamba
         self.mamba_c0 = TokenMambaStack(self.c0_dim, fusion_depth)
         self.mamba_c1 = TokenMambaStack(self.c1_dim, fusion_depth)
         self.mamba_c2 = TokenMambaStack(self.c2_dim, fusion_depth)
 
-        # self.mamba_c0_2 = TokenMambaStack(self.c0_dim, fusion_depth)
-        # self.mamba_c1_2 = TokenMambaStack(self.c1_dim, fusion_depth)
-        # self.mamba_c2_2 = TokenMambaStack(self.c2_dim, fusion_depth)
+        # 适配器（参数共享）
+        self.adapt_c1_to_c2 = TokenAdapter(self.c1_dim, self.c2_dim, self.c1_hw, self.c2_hw)
+        self.adapt_c0_to_c1 = TokenAdapter(self.c0_dim, self.c1_dim, self.c0_hw, self.c1_hw)
+        self.adapt_c2_to_c1 = TokenAdapter(self.c2_dim, self.c1_dim, self.c2_hw, self.c1_hw)
+        self.adapt_c1_to_c0 = TokenAdapter(self.c1_dim, self.c0_dim, self.c1_hw, self.c0_hw)
 
-        # 适配器（c1→c2, c0→c1, c2→c1, c1→c0） 两次迭代共用相同结构（参数共享）
-        self.adapt_c1_to_c2 = TokenAdapter(in_dim=self.c1_dim, out_dim=self.c2_dim,
-                                           in_hw=self.c1_hw, out_hw=self.c2_hw)
-        self.adapt_c0_to_c1 = TokenAdapter(in_dim=self.c0_dim, out_dim=self.c1_dim,
-                                           in_hw=self.c0_hw, out_hw=self.c1_hw)
-        self.adapt_c2_to_c1 = TokenAdapter(in_dim=self.c2_dim, out_dim=self.c1_dim,
-                                           in_hw=self.c2_hw, out_hw=self.c1_hw)
-        self.adapt_c1_to_c0 = TokenAdapter(in_dim=self.c1_dim, out_dim=self.c0_dim,
-                                           in_hw=self.c1_hw, out_hw=self.c0_hw)
-    
-        # 只在 c1 融合时需要 AAF (输入通道 = c1_dim, num_inputs=2)
         self.aaf_c1 = AAF(in_channels=self.c1_dim, num_inputs=2)
 
+        # --- MOD: 适配后归一化（你已有）保留
         self.ln_c1_to_c2 = nn.LayerNorm(self.c2_dim)
         self.ln_c0_to_c1 = nn.LayerNorm(self.c1_dim)
         self.ln_c2_to_c1 = nn.LayerNorm(self.c1_dim)
-        self.ln_c1_to_c0 = nn.LayerNorm(self.c0_dim)        
+        self.ln_c1_to_c0 = nn.LayerNorm(self.c0_dim)
 
-    def _fusion_step(self, c0, c1, c2,
-                     mamba_c0, mamba_c1, mamba_c2):
-        """
-        单步：
-          c2_next = c2 + M_c2( adapt(c1) )
-          c1_next = c1 + M_c1( AAF( adapt(c0), adapt(c2) ) )
-          c0_next = c0 + M_c0( adapt(c1) )
-        """
+        # --- MOD: 新增 源 tokens 适配“前”归一化，进一步统一不同尺度统计
+        self.src_ln_c0 = nn.LayerNorm(self.c0_dim)
+        self.src_ln_c1 = nn.LayerNorm(self.c1_dim)
+        self.src_ln_c2 = nn.LayerNorm(self.c2_dim)
+
+    def _fusion_step(self, c0, c1, c2, mamba_c0, mamba_c1, mamba_c2):
+        # --- MOD: 前归一化副本，不回写原变量以保持残差路径分布可观测
+        c0_src = self.src_ln_c0(c0)
+        c1_src = self.src_ln_c1(c1)
+        c2_src = self.src_ln_c2(c2)
+
         # c2 更新
-        c1_down_to_c2 = self.adapt_c1_to_c2(c1)           # (B,256,768)
+        c1_down_to_c2 = self.adapt_c1_to_c2(c1_src)
         c1_down_to_c2 = self.ln_c1_to_c2(c1_down_to_c2)
-        c2_delta = mamba_c2(c1_down_to_c2)                # (B,256,768)
+        c2_delta = mamba_c2(c1_down_to_c2)
         c2_next = c2 + c2_delta
 
-        # c1 更新 (AAF 融合 c0->c1 与 c2->c1)
-        c0_down_to_c1 = self.adapt_c0_to_c1(c0)           # (B,1024,192)
+        # c1 更新 (AAF 融合)
+        c0_down_to_c1 = self.adapt_c0_to_c1(c0_src)
         c0_down_to_c1 = self.ln_c0_to_c1(c0_down_to_c1)
-        c2_up_to_c1   = self.adapt_c2_to_c1(c2)           # (B,1024,192)
-        c2_up_to_c1   = self.ln_c2_to_c1(c2_up_to_c1)
+        c2_up_to_c1 = self.adapt_c2_to_c1(c2_src)
+        c2_up_to_c1 = self.ln_c2_to_c1(c2_up_to_c1)
+
         B, L1, C1 = c0_down_to_c1.shape
         H1, W1 = self.c1_hw
-        f0 = c0_down_to_c1.view(B,H1,W1,C1).permute(0,3,1,2)  # (B,192,32,32)
-        f2 = c2_up_to_c1.view(B,H1,W1,C1).permute(0,3,1,2)
-        fused_c1_feat = self.aaf_c1([f0, f2])             # (B,192,32,32)
+        f0 = c0_down_to_c1.view(B, H1, W1, C1).permute(0,3,1,2)
+        f2 = c2_up_to_c1.view(B, H1, W1, C1).permute(0,3,1,2)
+        fused_c1_feat = self.aaf_c1([f0, f2])
         fused_c1_tokens = fused_c1_feat.flatten(2).transpose(1,2)
+
         c1_delta = mamba_c1(fused_c1_tokens)
         c1_next = c1 + c1_delta
 
         # c0 更新
-        c1_up_to_c0 = self.adapt_c1_to_c0(c1)             # (B,4096,96)
+        c1_up_to_c0 = self.adapt_c1_to_c0(c1_src)
         c1_up_to_c0 = self.ln_c1_to_c0(c1_up_to_c0)
         c0_delta = mamba_c0(c1_up_to_c0)
         c0_next = c0 + c0_delta
@@ -407,71 +430,109 @@ class TwoIterMultiScaleFusion(nn.Module):
         return c0_next, c1_next, c2_next
 
     def forward(self, c0, c1, c2):
-        # 第一次迭代
-        c0_1, c1_1, c2_1 = self._fusion_step(
-            c0, c1, c2, self.mamba_c0, self.mamba_c1, self.mamba_c2
-        )
-        # 第二次迭代（使用同一套 Mamba 堆栈）
-        c0_2, c1_2, c2_2 = self._fusion_step(
-            c0_1, c1_1, c2_1, self.mamba_c0, self.mamba_c1, self.mamba_c2
-        )
+        c0_1, c1_1, c2_1 = self._fusion_step(c0, c1, c2,
+                                             self.mamba_c0, self.mamba_c1, self.mamba_c2)
+        c0_2, c1_2, c2_2 = self._fusion_step(c0_1, c1_1, c2_1,
+                                             self.mamba_c0, self.mamba_c1, self.mamba_c2)
         return c0_2, c1_2, c2_2
+
 
 # ================== 6. 统一解码器 ==================
 class UnifiedDecoderTokens(nn.Module):
     """
     输入：c0(4096,96), c1(1024,192), c2(256,768)
     输出：out (B,6,256,256)
+    主要稳定策略：
+      1. 预归一化三路 tokens（不改变原编码器输出，只在解码侧使用）
+      2. c2 投影前先 LN，再 Linear
+      3. 融合前对三路加可学习缩放 α_i
+      4. 融合后立即 LayerNorm2d
+      5. fuse_conv1x1 去 bias，减少均值漂移
+      6. 输出残差加 γ（初始 0.5）
     """
     def __init__(self):
         super().__init__()
-        self.c0_proj = nn.Linear(96, 192)
-        self.c2_proj = nn.Linear(768,192)
-        self.fuse_conv1x1 = nn.Conv2d(192*3, 192, 1)
+        # 投影
+        self.c0_proj = nn.Linear(96, 192, bias=True)
+        self.c2_proj = nn.Linear(768, 192, bias=True)
 
-        # 转置卷积上采样 64->128->256
+        # --- MOD: 预归一化（token 维度）---
+        self.c0_ln = nn.LayerNorm(96)
+        self.c1_ln = nn.LayerNorm(192)
+        self.c2_ln = nn.LayerNorm(768)
+
+        # --- MOD: 三路可学习缩放，初始化略低于1，缓冲方差 ---
+        self.alpha0 = nn.Parameter(torch.tensor(0.9))
+        self.alpha1 = nn.Parameter(torch.tensor(0.9))
+        self.alpha2 = nn.Parameter(torch.tensor(0.9))
+
+        # --- MOD: 融合 1x1 卷积去掉 bias，后接 LN ---
+        self.fuse_conv1x1 = nn.Conv2d(192*3, 192, 1, bias=False)
+        self.fuse_norm = LayerNorm2d(192)
+
+        # 上采样解码保持原结构
         self.decoder = nn.Sequential(
             nn.ConvTranspose2d(192,192,4,2,1, bias=False),
-            LayerNorm2d(192),  # 已经在项目里引入过 LayerNorm2d
+            LayerNorm2d(192),
             nn.GELU(),
             nn.ConvTranspose2d(192,192,4,2,1, bias=False),
             LayerNorm2d(192),
             nn.GELU(),
             nn.Conv2d(192,6,1)
         )
+        # --- MOD: 输出缩放 γ ---
+        self.gamma = nn.Parameter(torch.tensor(0.5))
 
     def forward(self, c0, c1, c2, x_in):
         B = c0.shape[0]
-        # c0: (B,4096,96) → proj
-        c0_192 = self.c0_proj(c0)  # (B,4096,192)
-        c0_map = c0_192.transpose(1,2).view(B,192,64,64)
 
-        # c1: (B,1024,192) → upsample 32→64
-        c1_map = c1.transpose(1,2).view(B,192,32,32)
+        # ========== 路径 c0 ==========
+        # (B,4096,96)  先 LN 再 Linear
+        c0_pre = self.c0_ln(c0)
+        c0_192 = self.c0_proj(c0_pre)                     # (B,4096,192)
+        c0_map = c0_192.transpose(1,2).view(B,192,64,64)  # (B,192,64,64)
+
+        # ========== 路径 c1 ==========
+        # (B,1024,192)
+        c1_pre = self.c1_ln(c1)
+        c1_map = c1_pre.transpose(1,2).view(B,192,32,32)
         c1_map = F.interpolate(c1_map, size=(64,64), mode='bilinear', align_corners=False)
 
-        # c2: (B,256,768) → upsample 16→64, proj
-        c2_map = c2.transpose(1,2).view(B,768,16,16)
+        # ========== 路径 c2 ==========
+        # (B,256,768)  先 LN 再上采样再 Linear
+        c2_pre = self.c2_ln(c2)
+        c2_map = c2_pre.transpose(1,2).view(B,768,16,16)
         c2_map = F.interpolate(c2_map, size=(64,64), mode='bilinear', align_corners=False)
+        # 展平→Linear→回 map
         c2_map = self.c2_proj(c2_map.flatten(2).transpose(1,2)).transpose(1,2).view(B,192,64,64)
+
+        # ========== 缩放 & 融合 ==========
+        c0_map = self.alpha0 * c0_map
+        c1_map = self.alpha1 * c1_map
+        c2_map = self.alpha2 * c2_map
 
         fused = torch.cat([c0_map, c1_map, c2_map], dim=1)   # (B,576,64,64)
         fused = self.fuse_conv1x1(fused)                     # (B,192,64,64)
+        fused = self.fuse_norm(fused)                        # --- MOD: 立刻规范化
+
+        # ========== 上采样解码 ==========
         D = self.decoder(fused)                              # (B,6,256,256)
 
         base = 0.3 * torch.cat([x_in, x_in], dim=1)          # (B,6,256,256)
-        out = base + D
+        out = base + self.gamma * D
         return out
 
 # ================== 7. 顶层整合主干（供 MTRRNet 调用） ==================
 class MTRRNet(nn.Module):
     def __init__(self):
         super().__init__()
+        self.input = nn.Identity()
         self.encoder = MultiBranchEncoder()
         self.fusion  = TwoIterMultiScaleFusion()
         self.decoder = UnifiedDecoderTokens()
 
     def forward(self, x):
+        x = self.input(x)
         c0, c1, c2 = self.encoder(x)
         c0_f, c1_f, c2_f = self.fusion(c0, c1, c2)
         out = self.decoder(c0_f, c1_f, c2_f, x)
@@ -539,11 +600,12 @@ class MTRREngine(nn.Module):
 
 
     def forward(self):
-        # with torch.no_grad():
-        #     self.Ic = self.net_c(self.I)
+        with torch.no_grad():
+            self.Ic = self.net_c(self.I)
+
         # self.out = self.netG_T(self.Ic) 
-        
         self.out = self.netG_T(self.I) 
+
         self.fake_T, self.fake_R = self.out[:,0:3,:,:],self.out[:,3:6,:,:]
         self.c_map = torch.zeros_like(self.I)
 

@@ -25,14 +25,14 @@ class CustomLoss(torch.nn.Module):
         
         # 2. 调整损失权重，避免过大权重
         self.ssim_loss_weight = 0.5
-        self.vgg_loss_weight = 1  # 从0.7降低到0.5，减少VGG损失的影响
+        self.vgg_loss_weight = 0.08  # 从0.7降低到0.5，减少VGG损失的影响
         self.mse_loss_weight = 0.3
         self.color_loss_weight = 0.4
         
         self.fake_R_weight = 0.3
         self.fake_T_weight = 1.0
-        self.Rcmaps_weight = 0.1
-        self.all_img_weight = 0.1
+        self.Rcmaps_weight = 0
+        self.all_img_weight = 0
 
     def forward(self, fake_Ts, label1, input_image, rcmaps, fake_Rs, label2):
 
@@ -162,47 +162,47 @@ class CustomLoss(torch.nn.Module):
         # 10. 确保输入在有效范围内
         # x = torch.clamp(x, 0.0, 1.0)
         # y = torch.clamp(y, 0.0, 1.0)
+        # (b) ImageNet 归一化
         mean = torch.tensor([0.485, 0.456, 0.406], device=x.device).view(1, 3, 1, 1)
         std  = torch.tensor([0.229, 0.224, 0.225], device=x.device).view(1, 3, 1, 1)
         x = (x - mean) / std
         y = (y - mean) / std
-        loss = 0.0
-        # 11. 保存中间层特征，避免重复计算
-        x_features = []
-        y_features = []
-        
-        # 提取特征但不计算梯度
-        with torch.enable_grad():
+
+        # (c) 先提取 target 特征（无梯度）
+        with torch.no_grad():
+            y_feats = []
+            tmp_y = y
             for i, layer in enumerate(self.vgg):
-                x = layer(x)
-                y = layer(y)
-                
+                tmp_y = layer(tmp_y)
                 if i in self.feature_layers:
-                    x_features.append(x)
-                    y_features.append(y)
-                    
+                    y_feats.append(tmp_y)
                 if i >= max(self.feature_layers):
                     break
-        
-        # 12. 设置递增权重，使深层特征权重更大
+
+        # (d) 再提取预测特征（需梯度）
+        x_feats = []
+        tmp_x = x
+        for i, layer in enumerate(self.vgg):
+            tmp_x = layer(tmp_x)
+            if i in self.feature_layers:
+                x_feats.append(tmp_x)
+            if i >= max(self.feature_layers):
+                break
+
+        # (e) 分层权重（保持原先递增趋势）
         weights = [0.1, 0.2, 0.4, 0.8, 1.0]
-        
-        # 13. 使用MSE而非L1损失，提高稳定性
-        for idx, (x_feat, y_feat) in enumerate(zip(x_features, y_features)):
-            # 重新启用梯度计算
-            x_feat = x_feat.requires_grad_(True)
-            y_feat = y_feat
-            
-            # 使用均方误差并添加数值稳定性
-            feat_diff = F.mse_loss(x_feat, y_feat)
-            
-            # 14. 对每层损失进行裁剪，避免极端值
-            # feat_loss = torch.clamp(feat_diff, 0.0, 10.0)
-            feat_loss = (feat_diff)
-            loss = loss + weights[idx] * feat_loss
-            
-        # 15. 归一化损失，使其不会因为层数增加而过大
-        return loss / sum(weights)
+        assert len(weights) == len(x_feats)
+
+        loss = 0.0
+        for w, xf, yf in zip(weights, x_feats, y_feats):
+            # L1 (mean) 已经是均值，不再额外归一化
+            layer_loss = torch.mean(torch.abs(xf - yf))
+            # 轻量安全裁剪，防止极端爆炸（不会影响正常梯度范围）
+            layer_loss = torch.clamp(layer_loss, max=50.0)
+            loss = loss + w * layer_loss
+
+        loss = loss / sum(weights)
+        return loss
     
 
 def color_mean_loss(pred, target):

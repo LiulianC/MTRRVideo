@@ -36,7 +36,7 @@ parser.add_argument("--host", type=bool, default="127.0.0.1")
 parser.add_argument("--port", default=57117)
 opts = parser.parse_args()
 opts.batch_size = 4
-opts.shuffle = False
+opts.shuffle = 0
 opts.display_id = -1  
 opts.num_workers = 0
 
@@ -50,8 +50,8 @@ opts.sampler_size3 = 800
 opts.test_size = [200,0,0]
 opts.epoch = 40
 opts.model_path='./model_fit/model_latest.pth'  
-# opts.model_path=None  #如果要load就注释我
-current_lr = 1e-4 # 不可大于1e-5 否则会引起深层网络的梯度爆炸
+opts.model_path=None  #如果要load就注释我
+current_lr = 1e-6 # 不可大于1e-5 否则会引起深层网络的梯度爆炸
 
 # nohup /home/gzm/cp310pt26/bin/python /home/gzm/gzm-MTRRVideo/train.py > /home/gzm/gzm-MTRRVideo/train.log 2>&1 &
 
@@ -271,17 +271,30 @@ if __name__ == '__main__':
 
             optimizer.zero_grad()
             # scaler.scale(all_loss).backward()
+
+            torch.autograd.set_detect_anomaly(True) # 检测异常nan 打印出具体算子 很消耗性能 训练时关闭
+
+            def detect_nan_grad(module, grad_input, grad_output):
+                for gi in grad_input:
+                    if gi is not None and (torch.isnan(gi).any() or torch.isinf(gi).any()):
+                        print(f"⚠️ NaN/Inf in grad_input of {module.__class__.__name__}")
+                for go in grad_output:
+                    if go is not None and (torch.isnan(go).any() or torch.isinf(go).any()):
+                        print(f"⚠️ NaN/Inf in grad_output of {module.__class__.__name__}")
+
+            for name, module in model.named_modules():
+                module.register_full_backward_hook(detect_nan_grad)
+
+            
             all_loss.backward()
-
-            # 防止梯度爆炸
-            # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            # torch.nn.utils.clip_grad_value_(model.parameters(), clip_value=1.0)
-
 
             # 打印每层梯度
             if opts.debug_monitor_layer_grad :
                 model.monitor_layer_grad()
 
+            # 防止梯度爆炸
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_value_(model.parameters(), clip_value=1.0)   
             # scaler.step(optimizer)
             # scaler.update()            
             optimizer.step()
