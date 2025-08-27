@@ -18,6 +18,74 @@ import math
 from timm.layers import LayerNorm2d
 
 
+def init_all_weights(model: nn.Module):
+    """
+    统一初始化策略（一次调用，覆盖全模型）：
+    1. Conv / ConvTranspose / Linear 采用 Xavier Uniform，针对 GELU 激活使用对应 gain，保证深层稳定
+    2. Mamba 相关投影层（dt_proj / x_proj / out_proj）缩小权重尺度（乘 0.5）以降低早期梯度爆炸风险
+    3. LayerNorm / BatchNorm / GroupNorm -> weight=1 bias=0
+    4. PReLU -> 小正值（0.05~0.10）避免过大负斜率
+    5. PatchEmbed 的 proj 卷积使用较大 gain（=2.0）提升早期收敛速度
+    6. 对于 bias 统一置 0
+    """
+    gelu_gain = nn.init.calculate_gain('relu')
+
+    def _init(m):
+        # Conv / ConvTranspose
+        if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d, nn.Conv1d)):
+            if m.weight is not None:
+                nn.init.xavier_uniform_(m.weight, gain=gelu_gain)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+
+        # Linear
+        elif isinstance(m, nn.Linear):
+            if m.weight is not None:
+                nn.init.xavier_uniform_(m.weight, gain=gelu_gain)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+
+        # Norm
+        elif isinstance(m, (nn.LayerNorm, nn.BatchNorm1d, nn.BatchNorm2d, nn.GroupNorm, LayerNorm2d)):
+            if getattr(m, 'weight', None) is not None:
+                nn.init.ones_(m.weight)
+            if getattr(m, 'bias', None) is not None:
+                nn.init.zeros_(m.bias)
+
+        # PReLU
+        elif isinstance(m, nn.PReLU):
+            with torch.no_grad():
+                m.weight.fill_(0.08)
+
+        # PatchEmbed 特殊加强
+        if isinstance(m, PatchEmbed):
+            if hasattr(m, 'proj') and hasattr(m.proj, 'weight'):
+                nn.init.xavier_uniform_(m.proj.weight, gain=2.0)
+                if m.proj.bias is not None:
+                    nn.init.zeros_(m.proj.bias)
+
+    model.apply(_init)
+
+    # 第二阶段：细化 Mamba 相关参数（按名字）
+    for name, param in model.named_parameters():
+        if param.requires_grad and param.dim() >= 2:
+            if any(k in name for k in ['dt_proj', 'x_proj', 'out_proj']):
+                # 缩放已初始化权重，降低初始方差
+                param.data *= 0.5
+
+        # 针对某些 out/head/proj 线性层再做一次零均值中心化（避免偏置漂移）
+        if param.requires_grad and param.dim() >= 2 and any(k in name.lower() for k in ['head.weight']):
+            param.data -= param.data.mean()
+
+    # 防御：极端异常值裁剪
+    with torch.no_grad():
+        for p in model.parameters():
+            if p.dim() >= 2:
+                if torch.isfinite(p).all():
+                    p.clamp_(-3.0, 3.0)
+
+
+
 # padding是边缘复制 减少边框伪影
 class Conv2DLayer(nn.Sequential):
     def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, norm=None, act=None, bias=False):
@@ -40,34 +108,39 @@ class Conv2DLayer(nn.Sequential):
 
 # Attention-Aware Fusion
 class AAF(nn.Module):
-    """
-    输入: List[Tensor], 每个 shape 为 [B, C, H, W]
-    输出: Tensor, shape 为 [B, C, H, W]
-    """
-    def __init__(self, in_channels, num_inputs): # in_channels 每个图像的通道 num_input 有多少个图像
+    def __init__(self, in_channels, num_inputs, expansion=4, temperature=2.0, use_bn=True):
         super(AAF, self).__init__()
         self.in_channels = in_channels
         self.num_inputs = num_inputs
-        
-        # 输入 concat 后通道为 C*num_inputs
-        self.attn = nn.Sequential(
-            nn.Conv2d(num_inputs * in_channels, num_inputs * in_channels * 16, kernel_size=1, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(num_inputs * in_channels * 16, num_inputs, kernel_size=1, bias=False),
-            nn.Softmax(dim=1)  # 对每个位置的 num_inputs 做归一化
-        )
+        self.temperature = temperature  # softmax 温度 >1 降低对极值敏感
+        hidden_channels = num_inputs * in_channels * expansion  # 原来是 *16 现在降到 *4 默认
+        layers = [
+            nn.Conv2d(num_inputs * in_channels, hidden_channels, 1, bias=False)
+        ]
+        if use_bn:
+            layers.append(nn.BatchNorm2d(hidden_channels))  # 归一化稳定方差
+        layers.append(nn.GELU())
+        layers.append(nn.Conv2d(hidden_channels, num_inputs, 1, bias=False))
+        self.attn = nn.Sequential(*layers)
+        # 初始化最后一层为 0，起始时近似均匀注意力
+        nn.init.zeros_(self.attn[-1].weight)
 
     def forward(self, features):
-        # features: list of Tensors [B, C, H, W]
-        B, C, H, W = features[0].shape
-        x = torch.cat(features, dim=1)  # shape: [B, C*num_inputs, H, W]
-        attn_weights = self.attn(x)     # shape: [B, num_inputs, H, W]
-        
-        # 融合：对每个尺度乘以权重后相加
+        # features: list[Tensors] 形状一致 [B,C,H,W]
+        x = torch.cat(features, dim=1)  # [B, num_inputs*C, H, W]
+        logits = self.attn(x)           # [B, num_inputs, H, W]
+        # 减去均值 → 中心化，防止数值过大饱和
+        logits = logits - logits.mean(dim=1, keepdim=True)
+        # 温度缩放
+        attn_weights = torch.softmax(logits / self.temperature, dim=1)
+        # 融合
         out = 0
-        for i in range(self.num_inputs):
-            weight = attn_weights[:, i:i+1, :, :]  # [B,1,H,W]
-            out += features[i] * weight            # 广播乘法
+        # 显式展开 2 输入（假设 num_inputs=2）
+        if self.num_inputs == 2:
+            out = features[0] * attn_weights[:, 0:1] + features[1] * attn_weights[:, 1:2]
+        else:
+            for i in range(self.num_inputs):
+                out = out + features[i] * attn_weights[:, i:i+1]
         return out
 
 
@@ -195,19 +268,19 @@ class MultiBranchEncoder(nn.Module):
         self.branch_c0 = SingleScaleEncoderBranch(
             in_ch=3, patch_size=4, embed_dim=96,
             img_size=256, input_resolution=(64,64),
-            swin_blocks=4, mamba_blocks=10, window_size=8
+            swin_blocks=4, mamba_blocks=4, window_size=8
         )
         # c1: 32x32, embed 192
         self.branch_c1 = SingleScaleEncoderBranch(
             in_ch=3, patch_size=8, embed_dim=192,
             img_size=256, input_resolution=(32,32),
-            swin_blocks=4, mamba_blocks=10, window_size=8
+            swin_blocks=4, mamba_blocks=4, window_size=8
         )
         # c2: 16x16, embed 768
         self.branch_c2 = SingleScaleEncoderBranch(
             in_ch=3, patch_size=16, embed_dim=768,
             img_size=256, input_resolution=(16,16),
-            swin_blocks=4, mamba_blocks=10, window_size=2
+            swin_blocks=4, mamba_blocks=4, window_size=2
         )
 
     def forward(self, x):
@@ -256,9 +329,9 @@ class TwoIterMultiScaleFusion(nn.Module):
         self.mamba_c1 = TokenMambaStack(self.c1_dim, fusion_depth)
         self.mamba_c2 = TokenMambaStack(self.c2_dim, fusion_depth)
 
-        self.mamba_c0_2 = TokenMambaStack(self.c0_dim, fusion_depth)
-        self.mamba_c1_2 = TokenMambaStack(self.c1_dim, fusion_depth)
-        self.mamba_c2_2 = TokenMambaStack(self.c2_dim, fusion_depth)
+        # self.mamba_c0_2 = TokenMambaStack(self.c0_dim, fusion_depth)
+        # self.mamba_c1_2 = TokenMambaStack(self.c1_dim, fusion_depth)
+        # self.mamba_c2_2 = TokenMambaStack(self.c2_dim, fusion_depth)
 
         # 适配器（c1→c2, c0→c1, c2→c1, c1→c0） 两次迭代共用相同结构（参数共享）
         self.adapt_c1_to_c2 = TokenAdapter(in_dim=self.c1_dim, out_dim=self.c2_dim,
@@ -269,9 +342,14 @@ class TwoIterMultiScaleFusion(nn.Module):
                                            in_hw=self.c2_hw, out_hw=self.c1_hw)
         self.adapt_c1_to_c0 = TokenAdapter(in_dim=self.c1_dim, out_dim=self.c0_dim,
                                            in_hw=self.c1_hw, out_hw=self.c0_hw)
-
+    
         # 只在 c1 融合时需要 AAF (输入通道 = c1_dim, num_inputs=2)
         self.aaf_c1 = AAF(in_channels=self.c1_dim, num_inputs=2)
+
+        self.ln_c1_to_c2 = nn.LayerNorm(self.c2_dim)
+        self.ln_c0_to_c1 = nn.LayerNorm(self.c1_dim)
+        self.ln_c2_to_c1 = nn.LayerNorm(self.c1_dim)
+        self.ln_c1_to_c0 = nn.LayerNorm(self.c0_dim)        
 
     def _fusion_step(self, c0, c1, c2,
                      mamba_c0, mamba_c1, mamba_c2):
@@ -283,12 +361,15 @@ class TwoIterMultiScaleFusion(nn.Module):
         """
         # c2 更新
         c1_down_to_c2 = self.adapt_c1_to_c2(c1)           # (B,256,768)
+        c1_down_to_c2 = self.ln_c1_to_c2(c1_down_to_c2)
         c2_delta = mamba_c2(c1_down_to_c2)                # (B,256,768)
         c2_next = c2 + c2_delta
 
         # c1 更新 (AAF 融合 c0->c1 与 c2->c1)
         c0_down_to_c1 = self.adapt_c0_to_c1(c0)           # (B,1024,192)
+        c0_down_to_c1 = self.ln_c0_to_c1(c0_down_to_c1)
         c2_up_to_c1   = self.adapt_c2_to_c1(c2)           # (B,1024,192)
+        c2_up_to_c1   = self.ln_c2_to_c1(c2_up_to_c1)
         B, L1, C1 = c0_down_to_c1.shape
         H1, W1 = self.c1_hw
         f0 = c0_down_to_c1.view(B,H1,W1,C1).permute(0,3,1,2)  # (B,192,32,32)
@@ -300,6 +381,7 @@ class TwoIterMultiScaleFusion(nn.Module):
 
         # c0 更新
         c1_up_to_c0 = self.adapt_c1_to_c0(c1)             # (B,4096,96)
+        c1_up_to_c0 = self.ln_c1_to_c0(c1_up_to_c0)
         c0_delta = mamba_c0(c1_up_to_c0)
         c0_next = c0 + c0_delta
 
@@ -310,9 +392,9 @@ class TwoIterMultiScaleFusion(nn.Module):
         c0_1, c1_1, c2_1 = self._fusion_step(
             c0, c1, c2, self.mamba_c0, self.mamba_c1, self.mamba_c2
         )
-        # 第二次迭代（使用另一套 Mamba 堆栈）
+        # 第二次迭代（使用同一套 Mamba 堆栈）
         c0_2, c1_2, c2_2 = self._fusion_step(
-            c0_1, c1_1, c2_1, self.mamba_c0_2, self.mamba_c1_2, self.mamba_c2_2
+            c0_1, c1_1, c2_1, self.mamba_c0, self.mamba_c1, self.mamba_c2
         )
         return c0_2, c1_2, c2_2
 
@@ -330,9 +412,11 @@ class UnifiedDecoderTokens(nn.Module):
 
         # 转置卷积上采样 64->128->256
         self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(192,192,4,2,1),  # 64 -> 128
+            nn.ConvTranspose2d(192,192,4,2,1, bias=False),
+            LayerNorm2d(192),  # 已经在项目里引入过 LayerNorm2d
             nn.GELU(),
-            nn.ConvTranspose2d(192,192,4,2,1),  # 128 -> 256
+            nn.ConvTranspose2d(192,192,4,2,1, bias=False),
+            LayerNorm2d(192),
             nn.GELU(),
             nn.Conv2d(192,6,1)
         )
@@ -383,7 +467,7 @@ class MTRREngine(nn.Module):
         self.opts  = opts
         self.visual_names = ['fake_T', 'fake_R', 'c_map', 'I', 'Ic', 'T', 'R']
         self.netG_T = MTRRNet().to(device)  
-        self.netG_T.apply(self.init_weights)
+        init_all_weights(self.netG_T)
         self.net_c = PretrainedConvNext_e2e("convnext_small_in22k").cuda()
         # print(torch.load('./pretrained/cls_model.pth', map_location=str(self.device)).keys())
         self.net_c.load_state_dict(torch.load('./cls/cls_models/clsbest.pth', map_location=str(self.device)))
@@ -532,56 +616,3 @@ class MTRREngine(nn.Module):
         print(tabulate(table, headers=["Layer", "Size", "Formatted"], tablefmt="grid"))
         print(f"\nTotal trainable parameters: {total:,}")    
 
-    @staticmethod
-    def init_weights(m):
-        # 通用卷积层
-        if isinstance(m, (nn.Conv2d, nn.Conv1d)):
-            nn.init.kaiming_uniform_(m.weight, nonlinearity='relu')
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
-        # 通用线性层
-        elif isinstance(m, nn.Linear):
-            nn.init.xavier_uniform_(m.weight)
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
-        # LayerNorm和BatchNorm
-        elif isinstance(m, nn.LayerNorm):
-            if m.weight is not None:
-                nn.init.ones_(m.weight)
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
-        elif isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.GroupNorm)):
-            if m.weight is not None:
-                nn.init.ones_(m.weight)
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
-        # PReLU特殊初始化 - 避免梯度不稳定
-        elif isinstance(m, nn.PReLU):
-            # 使用保守的小正值初始化PReLU参数，避免过大的负斜率
-            nn.init.uniform_(m.weight, 0.05, 0.1)
-
-        # 针对自定义模块/参数名
-        for name, param in m.named_parameters(recurse=False):
-            # 常见proj和自定义权重
-            if any([k in name.lower() for k in ['proj', 'out_proj', 'x_proj', 'conv', 'weight']]):
-                if param.dim() >= 2:  # 只初始化权重，不初始化bias
-                    # 用xavier对proj类参数更稳妥
-                    nn.init.xavier_uniform_(param)
-                elif param.dim() == 1:  # bias或者norm的weight
-                    if 'bias' in name or 'beta' in name:
-                        nn.init.zeros_(param)
-                    elif 'weight' in name or 'gamma' in name:
-                        nn.init.ones_(param)
-            
-            
-    
-
-# --------------------------
-# 模型验证
-# --------------------------
-if __name__ == "__main__":
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = MTRRNet().to(device)
-    x = torch.randn(1,3,256,256).to(device)  # 输入一张256x256 RGB图
-    y = model(x)
-    print(y.shape)  # 应输出 torch.Size([1, 3, 256, 256])

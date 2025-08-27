@@ -23,7 +23,6 @@ from dataset.new_dataset1 import *
 from torch import amp
 scaler = amp.GradScaler()
 from set_seed import set_seed 
-from fix_mamba_init import apply_improved_init  # 导入改进的初始化
 import torch
 torch.autograd.set_detect_anomaly(True)
 
@@ -59,12 +58,11 @@ current_lr = 1e-4 # 不可大于1e-5 否则会引起深层网络的梯度爆炸
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = MTRREngine(opts, device)
 # model.count_parameters()
-# 应用改进的初始化
-print("Applying improved initialization...")
-model.netG_T = apply_improved_init(model.netG_T)
+
+
 
 if opts.debug_monitor_layer_stats or opts.debug_monitor_layer_grad:
-    opts.epoch = 200
+    opts.epoch = 300
     opts.batch_size = 8
     opts.sampler_size1 = 0
     opts.sampler_size2 = 0
