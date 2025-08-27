@@ -20,69 +20,56 @@ from timm.layers import LayerNorm2d
 
 def init_all_weights(model: nn.Module):
     """
-    统一初始化策略（一次调用，覆盖全模型）：
-    1. Conv / ConvTranspose / Linear 采用 Xavier Uniform，针对 GELU 激活使用对应 gain，保证深层稳定
-    2. Mamba 相关投影层（dt_proj / x_proj / out_proj）缩小权重尺度（乘 0.5）以降低早期梯度爆炸风险
-    3. LayerNorm / BatchNorm / GroupNorm -> weight=1 bias=0
-    4. PReLU -> 小正值（0.05~0.10）避免过大负斜率
-    5. PatchEmbed 的 proj 卷积使用较大 gain（=2.0）提升早期收敛速度
-    6. 对于 bias 统一置 0
+    统一初始化策略（更新后）：
+    1. Conv / ConvTranspose / Linear -> Xavier Uniform (近似 GELU 用 relu gain)
+    2. 不再额外缩放 Mamba 的 dt_proj / x_proj / out_proj （先观察真实梯度/激活；若后续爆炸再考虑 LayerScale 或梯度裁剪）
+    3. Norm 层 weight=1 bias=0
+    4. PReLU weight=0.08
+    5. PatchEmbed 的 proj 卷积 gain=2.0
+    6. 最后裁剪异常值到 [-3,3]
     """
     gelu_gain = nn.init.calculate_gain('relu')
 
     def _init(m):
-        # Conv / ConvTranspose
         if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d, nn.Conv1d)):
             if m.weight is not None:
                 nn.init.xavier_uniform_(m.weight, gain=gelu_gain)
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
-
-        # Linear
         elif isinstance(m, nn.Linear):
             if m.weight is not None:
                 nn.init.xavier_uniform_(m.weight, gain=gelu_gain)
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
-
-        # Norm
         elif isinstance(m, (nn.LayerNorm, nn.BatchNorm1d, nn.BatchNorm2d, nn.GroupNorm, LayerNorm2d)):
             if getattr(m, 'weight', None) is not None:
                 nn.init.ones_(m.weight)
             if getattr(m, 'bias', None) is not None:
                 nn.init.zeros_(m.bias)
-
-        # PReLU
         elif isinstance(m, nn.PReLU):
             with torch.no_grad():
                 m.weight.fill_(0.08)
 
-        # PatchEmbed 特殊加强
+        # PatchEmbed 特殊初始化
         if isinstance(m, PatchEmbed):
-            if hasattr(m, 'proj') and hasattr(m.proj, 'weight'):
+            if hasattr(m, 'proj') and hasattr(m.proj, 'weight') and m.proj.weight is not None:
                 nn.init.xavier_uniform_(m.proj.weight, gain=2.0)
                 if m.proj.bias is not None:
                     nn.init.zeros_(m.proj.bias)
 
     model.apply(_init)
 
-    # 第二阶段：细化 Mamba 相关参数（按名字）
+    # 第二阶段：只做必要的均值校正（不再乘 0.5）
     for name, param in model.named_parameters():
-        if param.requires_grad and param.dim() >= 2:
-            if any(k in name for k in ['dt_proj', 'x_proj', 'out_proj']):
-                # 缩放已初始化权重，降低初始方差
-                param.data *= 0.5
-
-        # 针对某些 out/head/proj 线性层再做一次零均值中心化（避免偏置漂移）
-        if param.requires_grad and param.dim() >= 2 and any(k in name.lower() for k in ['head.weight']):
+        if not param.requires_grad:
+            continue
+        if param.dim() >= 2 and 'head.weight' in name.lower():
             param.data -= param.data.mean()
 
-    # 防御：极端异常值裁剪
     with torch.no_grad():
         for p in model.parameters():
-            if p.dim() >= 2:
-                if torch.isfinite(p).all():
-                    p.clamp_(-3.0, 3.0)
+            if p.dim() >= 2 and torch.isfinite(p).all():
+                p.clamp_(-3.0, 3.0)
 
 
 
@@ -186,19 +173,51 @@ class ResidualSwinBlock(nn.Module):
 
 
 # ================== 1. 通用 Token Mamba 堆叠 ==================
-class TokenMambaStack(nn.Module):
-    def __init__(self, dim, depth):
+
+class MambaFFBlock(nn.Module):
+    """
+    单个 Mamba Block + FFN：
+      x = x + Mamba(LN(x))
+      x = x + FFN(LN(x))
+    目的：提供非线性通道放大，避免 residual 早期彻底主导，提升梯度流动。
+    """
+    def __init__(self, dim, ff_ratio=4, dropout=0.0):
         super().__init__()
-        self.blocks = nn.ModuleList([
-            nn.Sequential(
-                nn.LayerNorm(dim),
-                Mamba(dim)
-            ) for _ in range(depth)
-        ])
+        hidden = dim * ff_ratio
+        self.norm1 = nn.LayerNorm(dim)
+        self.mamba = Mamba(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.ff = nn.Sequential(
+            nn.Linear(dim, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
+            nn.Linear(hidden, dim),
+            nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        )
+
+    def forward(self, x):
+        # 残差 1：Mamba
+        x = x + self.mamba(self.norm1(x))
+        # 残差 2：前馈
+        x = x + self.ff(self.norm2(x))
+        return x
+
+class TokenMambaStack(nn.Module):
+    """
+    深度堆叠：保持原接口 (dim, depth)，外部调用无需改动。
+    新增的前馈在每层内部，增强表示能力。
+    """
+    def __init__(self, dim, depth, ff_ratio=4, dropout=0.0):
+        super().__init__()
+        blocks = []
+        for i in range(depth):
+            blocks.append(MambaFFBlock(dim, ff_ratio=ff_ratio, dropout=dropout))
+        self.blocks = nn.ModuleList(blocks)
+
     def forward(self, x):  # x: (B,L,dim)
+        # 显式展开循环，便于 debug（若 depth 很大再换回 for）
         for blk in self.blocks:
-            residual = x
-            x = blk(x) + residual
+            x = blk(x)
         return x
 
 # ================== 2. 单分支编码（PatchEmbed + 并联 Mamba/Swin + AAF） ==================
@@ -520,11 +539,11 @@ class MTRREngine(nn.Module):
 
 
     def forward(self):
-        # self.init()
-        with torch.no_grad():
-            self.Ic = self.net_c(self.I)
+        # with torch.no_grad():
+        #     self.Ic = self.net_c(self.I)
+        # self.out = self.netG_T(self.Ic) 
+        
         self.out = self.netG_T(self.I) 
-        self.out = self.netG_T(self.Ic) 
         self.fake_T, self.fake_R = self.out[:,0:3,:,:],self.out[:,3:6,:,:]
         self.c_map = torch.zeros_like(self.I)
 
