@@ -404,7 +404,7 @@ if __name__ == '__main__':
                     save_image(test_rcmaps_List_cat, os.path.join(output_dir6, f'epoch{i}+{total_test_step}-test_Rcmaps_List.png'), nrow=4)
 
                 total_test_step += 1
-                test_pbar.set_postfix({'loss':all_loss.item(),'psnr':res['PSNR'], 'ssim':res['SSIM'], 'lmse':res['LMSE'],'ncc': res['NCC']})
+                test_pbar.set_postfix({'loss':total_test_loss,'psnr':res['PSNR'], 'ssim':res['SSIM'], 'lmse':res['LMSE'],'ncc': res['NCC']})
                 test_pbar.update(1)
 
 
