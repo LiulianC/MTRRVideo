@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from mamba_ssm import Mamba
 from timm.models.vision_transformer import PatchEmbed
-from timm.models.swin_transformer import SwinTransformerBlock
+from timm.models.swin_transformer import SwinTransformerStage
 from timm.layers import DropPath
 from collections import OrderedDict
 import numpy as np
@@ -172,34 +172,29 @@ class ResidualSwinBlock(nn.Module):
         self.token_H = input_resolution[0]
         self.window_size = window_size
         self.shift_size = shift_size
-        self.swin_blocks = swin_blocks
 
+        # 使用 SwinTransformerStage 替代手动堆叠 Block
+        self.stage = SwinTransformerStage(
+            dim=dim,
+            input_resolution=input_resolution,
+            depth=swin_blocks,           # 原来循环的次数
+            num_heads=num_heads,
+            window_size=window_size,
+            mlp_ratio=mlp_ratio,
+            qkv_bias=True,
+            drop=0.1,
+            attn_drop=0.0,
+            drop_path=0.1,
+            downsample=None,            # 如果需要下采样，可以传 PatchMerging
+            use_checkpoint=False
+        )
 
-        self.blocks = nn.ModuleList()
-        for _ in range(swin_blocks):
-            self.blocks.append(nn.Sequential(
-                nn.LayerNorm(dim),  # swin自带layernorm 多一个扰乱分布
-                SwinTransformerBlock(
-                    dim=dim,
-                    input_resolution=input_resolution,
-                    num_heads=num_heads,
-                    window_size=window_size,
-                    shift_size=shift_size,
-                    mlp_ratio=mlp_ratio
-                )
-            ))
-
-    def forward(self, x_emb):# token (B, H/4, W/4, embedim)
-
+    def forward(self, x_emb):  # token (B, H/4, W/4, embed_dim)
         if self.token_H % self.window_size != 0:
             print(f"Warning: Token height {self.token_H} is not divisible by window size {self.window_size}. Padding may be needed.")
-        if self.window_size //2 != self.shift_size:
-            print(f"Warning: Window size {self.window_size} and shift size {self.shift_size} are not compatible.")
-
-        for block in self.blocks:
-            res = x_emb
-            x_emb = block(x_emb) + res  
-        return x_emb # token (B, H/4, W/4, embedim)
+        # SwinTransformerStage 内部已经处理 W-MSA 和 SW-MSA 的交替
+        x_emb = self.stage(x_emb)
+        return x_emb
 
 
 
@@ -416,7 +411,7 @@ class TwoIterMultiScaleFusion(nn.Module):
         f0 = c0_down_to_c1.view(B, H1, W1, C1).permute(0,3,1,2)
         f2 = c2_up_to_c1.view(B, H1, W1, C1).permute(0,3,1,2)
         fused_c1_feat = self.aaf_c1([f0, f2])
-        fused_c1_tokens = fused_c1_feat.flatten(2).transpose(1,2)
+        fused_c1_tokens = fused_c1_feat.flatten(2).transpose(1,2) 
 
         c1_delta = mamba_c1(fused_c1_tokens)
         c1_next = c1 + c1_delta

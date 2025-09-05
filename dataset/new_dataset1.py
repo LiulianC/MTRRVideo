@@ -37,7 +37,7 @@ def __scale_height(img, target_height):
     return img.resize((w, h), Image.BICUBIC)
 
 # 对输入的两张图像（如退化图像与目标清晰图像）进行 ​​同步或异步的预处理与增强
-def paired_data_transforms(img_1, img_2, img_3, unaligned_transforms=False):
+def paired_data_transforms(img_1, img_2, img_3, HW, unaligned_transforms=False):
 
     def get_params(img, output_size):
         w, h = img.size
@@ -75,7 +75,7 @@ def paired_data_transforms(img_1, img_2, img_3, unaligned_transforms=False):
         img_3 = TF.rotate(img_3, angle)
 
     # 随机裁剪​​：随机在（i,j）位置会有小偏移
-    i, j, h, w = get_params(img_1, (256, 256)) # （i,j）是左上角坐标 h w是目标大小
+    i, j, h, w = get_params(img_1, HW) # （i,j）是左上角坐标 h w是目标大小
     img_1 = TF.crop(img_1, i, j, h, w) # 这里就已经变成目标大小了
 
 
@@ -271,7 +271,49 @@ class DSRDataset(BaseDataset):
 
 
 
+from typing import Tuple
+def random_clip_images(target_size: Tuple[int,int], *images: torch.Tensor):
+    """
+    对多张图片在同一随机位置裁剪
+    输入：
+        target_size: (out_h, out_w)
+        images: 多张 torch.Tensor, shape (C,H,W) 或 (B,C,H,W)
+    输出：
+        tuple of clipped images, 与输入顺序对应
+    """
+    out_h, out_w = target_size
+    
+    # 判断 batch size 和 channel
+    clipped_images = []
+    for img in images:
+        if img.ndim == 3:  # C,H,W -> 变成 1,C,H,W
+            img = img.unsqueeze(0)
+        elif img.ndim != 4:
+            raise ValueError("每张图片必须是 (C,H,W) 或 (B,C,H,W)")
 
+    # 统一从第一张图片获取 H,W
+    ref = images[0] if isinstance(images[0], torch.Tensor) else images[0][0]
+    H, W = ref.shape[-2], ref.shape[-1]
+
+    if out_h > H or out_w > W:
+        raise ValueError("裁剪尺寸不能大于原图尺寸")
+
+    # 随机裁剪起点
+    start_h = torch.randint(0, H - out_h + 1, (1,)).item()
+    start_w = torch.randint(0, W - out_w + 1, (1,)).item()
+
+    # 裁剪
+    for img in images:
+        is_3d = False
+        if img.ndim == 3:
+            img = img.unsqueeze(0)
+            is_3d = True
+        clipped = img[:, :, start_h:start_h+out_h, start_w:start_w+out_w]
+        if is_3d:
+            clipped = clipped.squeeze(0)
+        clipped_images.append(clipped)
+
+    return tuple(clipped_images)
 
 
 
@@ -289,7 +331,7 @@ class DSRTestDataset(BaseDataset):
         self.unaligned_transforms = unaligned_transforms
         self.round_factor = round_factor
         self.flag = flag
-        self.if_align = True # if_align
+        self.if_align = if_align 
         self.real = real
         self.HW = HW
         
@@ -339,8 +381,12 @@ class DSRTestDataset(BaseDataset):
 
 
 
-    def align(self, x1, x2, x3):
-        h, w = self.HW[0], self.HW[1]
+    def align(self, x1, x2, x3, HW):
+
+        h, w = HW[0], HW[1]
+        if h % 2 !=0 and w % 2 !=0:
+            return x1, x2, x3 # 故意奇数的 传回奇数
+        
         h, w = h // 32 * 32, w // 32 * 32
         # h_new, w = h + (32 - h % 32), w + 
         x1 = x1.resize((w, h))
@@ -362,15 +408,19 @@ class DSRTestDataset(BaseDataset):
         except Exception:
             r_img = Image.fromarray(np.clip(np.array(m_img, dtype=np.float32) - np.array(t_img, dtype=np.float32), 0, 255).astype(np.uint8))
 
+
+
         if self.enable_transforms:
-            t_img, m_img, r_img = paired_data_transforms(t_img, m_img, r_img, self.unaligned_transforms)
+            t_img, m_img, r_img = paired_data_transforms(t_img, m_img, r_img, unaligned_transforms=self.unaligned_transforms, HW=self.HW)
 
         if self.if_align:
-            t_img, m_img, r_img = self.align(t_img, m_img, r_img)
+            t_img, m_img, r_img = self.align(t_img, m_img, r_img, HW=self.HW)
 
         B = TF.to_tensor(t_img)
         M = TF.to_tensor(m_img)
         R = TF.to_tensor(r_img)
+
+        B,M,R = random_clip_images(self.HW, B,M,R)        
 
         dic = {'input': M, 'target_t': B, 'fn': filename, 'real': self.real, 'target_r': R}
         if self.flag is not None:

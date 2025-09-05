@@ -24,7 +24,6 @@ from torch import amp
 scaler = amp.GradScaler()
 from set_seed import set_seed 
 import torch
-torch.autograd.set_detect_anomaly(True)
 
 
 warnings.filterwarnings('ignore')
@@ -36,11 +35,11 @@ parser.add_argument("--host", type=bool, default="127.0.0.1")
 parser.add_argument("--port", default=57117)
 opts = parser.parse_args()
 opts.batch_size = 4
-opts.shuffle = 0
+opts.shuffle = 1
 opts.display_id = -1  
 opts.num_workers = 0
 
-opts.always_print = 0
+opts.always_print = 1
 opts.debug_monitor_layer_stats = 1 # debug模式开启时 epoch和size都要为1 要load模型 可同时打开
 opts.debug_monitor_layer_grad = 1 # # debug模式开启时 epoch和size都要为1 要load模型bash
 opts.draw_attention_map = False # 注册cbam钩子 画注意力热力图 训练数据集要改 epoch和size都要为1 要load模型 batchsize要改1
@@ -49,8 +48,8 @@ opts.sampler_size2 = 0
 opts.sampler_size3 = 800
 opts.test_size = [200,0,0]
 opts.epoch = 40
-opts.model_path='./model_fit/model_latest.pth'  
-opts.model_path=None  #如果要load就注释我
+opts.model_path='./model_fit/model_202.pth'  
+# opts.model_path=None  #如果要load就注释我
 current_lr = 1e-5 # 不可大于1e-5 否则会引起深层网络的梯度爆炸
 
 # nohup /home/gzm/cp310pt26/bin/python /home/gzm/gzm-MTRRVideo/train.py > /home/gzm/gzm-MTRRVideo/train.log 2>&1 &
